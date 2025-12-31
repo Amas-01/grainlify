@@ -56,6 +56,13 @@ func New(cfg config.Config, deps Deps) *fiber.App {
 	app.Use(logger.New())
 
 	// Routes.
+	app.Get("/", func(c *fiber.Ctx) error {
+		return c.Status(fiber.StatusOK).JSON(fiber.Map{
+			"service": "grainlify-api",
+			"status":  "running",
+			"version": "1.0.0",
+		})
+	})
 	app.Get("/health", handlers.Health())
 	app.Get("/ready", handlers.Ready(deps.DB))
 
