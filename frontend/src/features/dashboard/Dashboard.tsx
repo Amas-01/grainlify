@@ -12,6 +12,7 @@ import grainlifyLogo from '../../assets/grainlify_log.svg';
 import { useTheme } from '../../shared/contexts/ThemeContext';
 import { LanguageIcon } from '../../shared/components/LanguageIcon';
 import { UserProfileDropdown } from '../../shared/components/UserProfileDropdown';
+import { NotificationsDropdown } from '../../shared/components/NotificationsDropdown';
 import { RoleSwitcher } from '../../shared/components/RoleSwitcher';
 import { Modal, ModalFooter, ModalButton, ModalInput } from '../../shared/components/ui/Modal';
 import { bootstrapAdmin } from '../../shared/api/client';
@@ -34,11 +35,12 @@ import { AdminPage } from '../admin/pages/AdminPage';
 import { SearchPage } from './pages/SearchPage';
 import { SettingsTabType } from '../settings/types';
 
+
 export function Dashboard() {
   const { userRole, logout, login } = useAuth();
   const { theme, toggleTheme } = useTheme();
   const navigate = useNavigate();
-  const [currentPage, setCurrentPage] = useState('discover');
+  // const [currentPage, setCurrentPage] = useState('discover');
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
   const [selectedIssue, setSelectedIssue] = useState<{ issueId: string; projectId?: string } | null>(null);
   const [selectedEcosystemId, setSelectedEcosystemId] = useState<string | null>(null);
@@ -52,6 +54,22 @@ export function Dashboard() {
   const [viewingUserLogin, setViewingUserLogin] = useState<string | null>(null);
   const [settingsInitialTab, setSettingsInitialTab] = useState<SettingsTabType>('profile');
 
+
+  // ******************************************
+
+// Persist current tab across reload
+  const [currentPage, setCurrentPage] = useState(() => {
+    const params = new URLSearchParams(window.location.search);
+    const tabFromUrl = params.get("tab");
+    if (tabFromUrl) return tabFromUrl;
+
+    return localStorage.getItem("dashboardTab") || "discover";
+  });
+
+
+
+
+
   // Admin password gating (bootstrap token)
   const [showAdminPasswordModal, setShowAdminPasswordModal] = useState(false);
   const [adminPassword, setAdminPassword] = useState('');
@@ -61,25 +79,52 @@ export function Dashboard() {
   });
   const [pendingAdminTarget, setPendingAdminTarget] = useState<'nav' | 'role' | null>(null);
 
+ 
+
+
+
+
+
+
+
   // Check URL params for viewing other users' profiles
-  useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const userParam = params.get('user');
-    const pageParam = params.get('page');
+  // useEffect(() => {
+  //   const params = new URLSearchParams(window.location.search);
+  //   const userParam = params.get('user');
+  //   const pageParam = params.get('page');
     
-    if (pageParam === 'profile' && userParam) {
-      setCurrentPage('profile');
-      // Check if it's a UUID (user_id) or a username (login)
-      const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-      if (uuidRegex.test(userParam)) {
-        setViewingUserId(userParam);
-        setViewingUserLogin(null);
-      } else {
-        setViewingUserLogin(userParam);
-        setViewingUserId(null);
-      }
-    }
-  }, []);
+  //   if (pageParam === 'profile' && userParam) {
+  //     setCurrentPage('profile');
+  //     // Check if it's a UUID (user_id) or a username (login)
+  //     const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  //     if (uuidRegex.test(userParam)) {
+  //       setViewingUserId(userParam);
+  //       setViewingUserLogin(null);
+  //     } else {
+  //       setViewingUserLogin(userParam);
+  //       setViewingUserId(null);
+  //     }
+  //   }
+  // }, []);
+
+// *******************************
+ useEffect(() => {
+    // Save tab in URL + localStorage whenever it changes
+    const params = new URLSearchParams(window.location.search);
+    params.set("tab", currentPage);
+    const newUrl = `${window.location.pathname}?${params.toString()}`;
+    window.history.replaceState({}, "", newUrl);
+
+    localStorage.setItem("dashboardTab", currentPage);
+  }, [currentPage]);
+
+  // Example tab list
+  const tabs = ["discover", "browse", "open-source-week", "ecosystems", "contributors", "settings"];
+
+  
+
+
+
 
   // Keyboard shortcut for search (Cmd+K / Ctrl+K)
   useEffect(() => {
@@ -410,23 +455,8 @@ export function Dashboard() {
               )}
             </button>
 
-            {/* Notifications - Separate Pill Button */}
-            <button
-              className={`h-[46px] w-[46px] rounded-full relative flex items-center justify-center backdrop-blur-[40px] transition-all hover:scale-105 shadow-[0px_6px_6.5px_-1px_rgba(0,0,0,0.36),0px_0px_4.2px_0px_rgba(0,0,0,0.69)] ${
-                darkTheme ? 'bg-[#2d2820]' : 'bg-[#d4c5b0]'
-              }`}
-            >
-              <div className={`absolute inset-0 pointer-events-none rounded-full ${
-                darkTheme
-                  ? 'shadow-[inset_1px_-1px_1px_0px_rgba(0,0,0,0.5),inset_-2px_2px_1px_-1px_rgba(255,255,255,0.11)]'
-                  : 'shadow-[inset_1px_-1px_1px_0px_rgba(0,0,0,0.15),inset_-2px_2px_1px_-1px_rgba(255,255,255,0.35)]'
-              }`} />
-              <Bell className={`w-4 h-4 relative z-10 transition-colors ${
-                darkTheme ? 'text-[rgba(255,255,255,0.69)]' : 'text-[rgba(45,40,32,0.75)]'
-              }`} />
-              {/* Notification Badge - Golden Dot */}
-              <div className="absolute -top-1 -right-1 w-4 h-4 bg-gradient-to-br from-[#e8c571] to-[#c9983a] rounded-full shadow-[0_2px_8px_rgba(201,152,58,0.9),0_0_12px_rgba(201,152,58,0.7)] z-20 border-[2px] border-white" />
-            </button>
+            {/* Notifications Dropdown */}
+            <NotificationsDropdown />
 
             {/* User Profile Dropdown - Shows profile when authenticated, Sign In when not */}
             <UserProfileDropdown onPageChange={handleNavigation} />
