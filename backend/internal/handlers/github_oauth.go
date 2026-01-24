@@ -70,6 +70,8 @@ VALUES ($1, $2, 'github_link', $3)
 }
 
 // LoginStart begins GitHub-only login/signup (no prior JWT required).
+// Accepts optional 'redirect' query parameter to specify where to redirect after successful login.
+// This enables single OAuth callback URL to work with multiple frontend deployments (production, preview, etc.)
 func (h *GitHubOAuthHandler) LoginStart() fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		if h.db == nil || h.db.Pool == nil {
@@ -79,13 +81,23 @@ func (h *GitHubOAuthHandler) LoginStart() fiber.Handler {
 			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "github_login_not_configured"})
 		}
 
+		// Get redirect_uri from query parameter (frontend origin)
+		redirectURI := c.Query("redirect")
+		// Validate redirect_uri is a valid URL if provided
+		if redirectURI != "" {
+			if _, err := url.Parse(redirectURI); err != nil {
+				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid_redirect_uri"})
+			}
+		}
+
 		state := randomState(32)
 		expiresAt := time.Now().UTC().Add(10 * time.Minute)
 
+		// Store redirect_uri in oauth_states table for later use in callback
 		_, err := h.db.Pool.Exec(c.Context(), `
-INSERT INTO oauth_states (state, user_id, kind, expires_at)
-VALUES ($1, NULL, 'github_login', $2)
-`, state, expiresAt)
+INSERT INTO oauth_states (state, user_id, kind, expires_at, redirect_uri)
+VALUES ($1, NULL, 'github_login', $2, $3)
+`, state, expiresAt, redirectURI)
 		if err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "state_create_failed"})
 		}
@@ -126,12 +138,13 @@ func (h *GitHubOAuthHandler) CallbackUnified() fiber.Handler {
 
 		var storedKind string
 		var stateUserID *uuid.UUID
+		var storedRedirectURI *string
 		err := h.db.Pool.QueryRow(c.Context(), `
-SELECT kind, user_id
+SELECT kind, user_id, redirect_uri
 FROM oauth_states
 WHERE state = $1
   AND expires_at > now()
-`, state).Scan(&storedKind, &stateUserID)
+`, state).Scan(&storedKind, &stateUserID, &storedRedirectURI)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid_or_expired_state"})
 		}
@@ -225,9 +238,17 @@ UPDATE users SET github_user_id = $2, updated_at = now() WHERE id = $1
 				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "token_issue_failed"})
 			}
 
-			// Determine redirect URL: use config if set, otherwise construct from FrontendBaseURL
-			redirectURL := h.cfg.GitHubLoginSuccessRedirectURL
-			if redirectURL == "" && h.cfg.FrontendBaseURL != "" {
+			// Determine redirect URL priority:
+			// 1. Stored redirect_uri from frontend (enables multi-environment support)
+			// 2. Config GitHubLoginSuccessRedirectURL
+			// 3. Construct from FrontendBaseURL
+			var redirectURL string
+			if storedRedirectURI != nil && *storedRedirectURI != "" {
+				// Use the redirect_uri provided by the frontend (supports preview deployments, forks, etc.)
+				redirectURL = strings.TrimSuffix(*storedRedirectURI, "/") + "/auth/callback"
+			} else if h.cfg.GitHubLoginSuccessRedirectURL != "" {
+				redirectURL = h.cfg.GitHubLoginSuccessRedirectURL
+			} else if h.cfg.FrontendBaseURL != "" {
 				redirectURL = strings.TrimSuffix(h.cfg.FrontendBaseURL, "/") + "/auth/callback"
 			}
 
