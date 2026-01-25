@@ -1,4 +1,3 @@
-
 //! # Bounty Escrow Smart Contract
 //!
 //! A trustless escrow system for bounty payments on the Stellar blockchain.
@@ -91,11 +90,202 @@
 mod events;
 mod test_bounty_escrow;
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, Env};
 use events::{
-    BountyEscrowInitialized, FundsLocked, FundsReleased, FundsRefunded,
-    emit_bounty_initialized, emit_funds_locked, emit_funds_released, emit_funds_refunded
+    emit_bounty_initialized, emit_funds_locked, emit_funds_refunded, emit_funds_released,
+    BountyEscrowInitialized, FundsLocked, FundsRefunded, FundsReleased,
 };
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol,
+};
+
+// ==================== MONITORING MODULE ====================
+mod monitoring {
+    use soroban_sdk::{contracttype, symbol_short, Address, Env, String, Symbol};
+
+    // Storage keys
+    const OPERATION_COUNT: &str = "op_count";
+    const USER_COUNT: &str = "usr_count";
+    const ERROR_COUNT: &str = "err_count";
+
+    // Event: Operation metric
+    #[contracttype]
+    #[derive(Clone, Debug)]
+    pub struct OperationMetric {
+        pub operation: Symbol,
+        pub caller: Address,
+        pub timestamp: u64,
+        pub success: bool,
+    }
+
+    // Event: Performance metric
+    #[contracttype]
+    #[derive(Clone, Debug)]
+    pub struct PerformanceMetric {
+        pub function: Symbol,
+        pub duration: u64,
+        pub timestamp: u64,
+    }
+
+    // Data: Health status
+    #[contracttype]
+    #[derive(Clone, Debug)]
+    pub struct HealthStatus {
+        pub is_healthy: bool,
+        pub last_operation: u64,
+        pub total_operations: u64,
+        pub contract_version: String,
+    }
+
+    // Data: Analytics
+    #[contracttype]
+    #[derive(Clone, Debug)]
+    pub struct Analytics {
+        pub operation_count: u64,
+        pub unique_users: u64,
+        pub error_count: u64,
+        pub error_rate: u32,
+    }
+
+    // Data: State snapshot
+    #[contracttype]
+    #[derive(Clone, Debug)]
+    pub struct StateSnapshot {
+        pub timestamp: u64,
+        pub total_operations: u64,
+        pub total_users: u64,
+        pub total_errors: u64,
+    }
+
+    // Data: Performance stats
+    #[contracttype]
+    #[derive(Clone, Debug)]
+    pub struct PerformanceStats {
+        pub function_name: Symbol,
+        pub call_count: u64,
+        pub total_time: u64,
+        pub avg_time: u64,
+        pub last_called: u64,
+    }
+
+    // Track operation
+    pub fn track_operation(env: &Env, operation: Symbol, caller: Address, success: bool) {
+        let key = Symbol::new(env, OPERATION_COUNT);
+        let count: u64 = env.storage().persistent().get(&key).unwrap_or(0);
+        env.storage().persistent().set(&key, &(count + 1));
+
+        if !success {
+            let err_key = Symbol::new(env, ERROR_COUNT);
+            let err_count: u64 = env.storage().persistent().get(&err_key).unwrap_or(0);
+            env.storage().persistent().set(&err_key, &(err_count + 1));
+        }
+
+        env.events().publish(
+            (symbol_short!("metric"), symbol_short!("op")),
+            OperationMetric {
+                operation,
+                caller,
+                timestamp: env.ledger().timestamp(),
+                success,
+            },
+        );
+    }
+
+    // Track performance
+    pub fn emit_performance(env: &Env, function: Symbol, duration: u64) {
+        let count_key = (Symbol::new(env, "perf_cnt"), function.clone());
+        let time_key = (Symbol::new(env, "perf_time"), function.clone());
+
+        let count: u64 = env.storage().persistent().get(&count_key).unwrap_or(0);
+        let total: u64 = env.storage().persistent().get(&time_key).unwrap_or(0);
+
+        env.storage().persistent().set(&count_key, &(count + 1));
+        env.storage()
+            .persistent()
+            .set(&time_key, &(total + duration));
+
+        env.events().publish(
+            (symbol_short!("metric"), symbol_short!("perf")),
+            PerformanceMetric {
+                function,
+                duration,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+    }
+
+    // Health check
+    pub fn health_check(env: &Env) -> HealthStatus {
+        let key = Symbol::new(env, OPERATION_COUNT);
+        let ops: u64 = env.storage().persistent().get(&key).unwrap_or(0);
+
+        HealthStatus {
+            is_healthy: true,
+            last_operation: env.ledger().timestamp(),
+            total_operations: ops,
+            contract_version: String::from_str(env, "1.0.0"),
+        }
+    }
+
+    // Get analytics
+    pub fn get_analytics(env: &Env) -> Analytics {
+        let op_key = Symbol::new(env, OPERATION_COUNT);
+        let usr_key = Symbol::new(env, USER_COUNT);
+        let err_key = Symbol::new(env, ERROR_COUNT);
+
+        let ops: u64 = env.storage().persistent().get(&op_key).unwrap_or(0);
+        let users: u64 = env.storage().persistent().get(&usr_key).unwrap_or(0);
+        let errors: u64 = env.storage().persistent().get(&err_key).unwrap_or(0);
+
+        let error_rate = if ops > 0 {
+            ((errors as u128 * 10000) / ops as u128) as u32
+        } else {
+            0
+        };
+
+        Analytics {
+            operation_count: ops,
+            unique_users: users,
+            error_count: errors,
+            error_rate,
+        }
+    }
+
+    // Get state snapshot
+    pub fn get_state_snapshot(env: &Env) -> StateSnapshot {
+        let op_key = Symbol::new(env, OPERATION_COUNT);
+        let usr_key = Symbol::new(env, USER_COUNT);
+        let err_key = Symbol::new(env, ERROR_COUNT);
+
+        StateSnapshot {
+            timestamp: env.ledger().timestamp(),
+            total_operations: env.storage().persistent().get(&op_key).unwrap_or(0),
+            total_users: env.storage().persistent().get(&usr_key).unwrap_or(0),
+            total_errors: env.storage().persistent().get(&err_key).unwrap_or(0),
+        }
+    }
+
+    // Get performance stats
+    pub fn get_performance_stats(env: &Env, function_name: Symbol) -> PerformanceStats {
+        let count_key = (Symbol::new(env, "perf_cnt"), function_name.clone());
+        let time_key = (Symbol::new(env, "perf_time"), function_name.clone());
+        let last_key = (Symbol::new(env, "perf_last"), function_name.clone());
+
+        let count: u64 = env.storage().persistent().get(&count_key).unwrap_or(0);
+        let total: u64 = env.storage().persistent().get(&time_key).unwrap_or(0);
+        let last: u64 = env.storage().persistent().get(&last_key).unwrap_or(0);
+
+        let avg = if count > 0 { total / count } else { 0 };
+
+        PerformanceStats {
+            function_name,
+            call_count: count,
+            total_time: total,
+            avg_time: avg,
+            last_called: last,
+        }
+    }
+}
+// ==================== END MONITORING MODULE ====================
 
 // ============================================================================
 // Error Definitions
@@ -124,24 +314,26 @@ use events::{
 pub enum Error {
     /// Returned when attempting to initialize an already initialized contract
     AlreadyInitialized = 1,
-    
+
     /// Returned when calling contract functions before initialization
     NotInitialized = 2,
-    
+
     /// Returned when attempting to lock funds with a duplicate bounty ID
     BountyExists = 3,
-    
+
     /// Returned when querying or operating on a non-existent bounty
     BountyNotFound = 4,
-    
+
     /// Returned when attempting operations on non-LOCKED funds
     FundsNotLocked = 5,
-    
+
     /// Returned when attempting refund before the deadline has passed
     DeadlineNotPassed = 6,
-    
+
     /// Returned when caller lacks required authorization for the operation
     Unauthorized = 7,
+    InvalidAmount = 8,
+    InvalidDeadline = 9,
 }
 
 // ============================================================================
@@ -218,6 +410,7 @@ pub enum DataKey {
     Admin,
     Token,
     Escrow(u64), // bounty_id
+    ReentrancyGuard,
 }
 
 // ============================================================================
@@ -232,7 +425,7 @@ impl BountyEscrowContract {
     // ========================================================================
     // Initialization
     // ========================================================================
-    
+
     /// Initializes the Bounty Escrow contract with admin and token addresses.
     ///
     /// # Arguments
@@ -268,11 +461,15 @@ impl BountyEscrowContract {
     /// # Gas Cost
     /// Low - Only two storage writes
     pub fn init(env: Env, admin: Address, token: Address) -> Result<(), Error> {
+        let start = env.ledger().timestamp();
+        let caller = admin.clone();
+
         // Prevent re-initialization
         if env.storage().instance().has(&DataKey::Admin) {
+            monitoring::track_operation(&env, symbol_short!("init"), caller, false);
             return Err(Error::AlreadyInitialized);
         }
-        
+
         // Store configuration
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Token, &token);
@@ -281,11 +478,18 @@ impl BountyEscrowContract {
         emit_bounty_initialized(
             &env,
             BountyEscrowInitialized {
-                admin,
+                admin: admin.clone(),
                 token,
-                timestamp: env.ledger().timestamp()
+                timestamp: env.ledger().timestamp(),
             },
         );
+
+        // Track successful operation
+        monitoring::track_operation(&env, symbol_short!("init"), caller, true);
+
+        // Track performance
+        let duration = env.ledger().timestamp().saturating_sub(start);
+        monitoring::emit_performance(&env, symbol_short!("init"), duration);
 
         Ok(())
     }
@@ -332,7 +536,7 @@ impl BountyEscrowContract {
     /// let depositor = Address::from_string("GDEPOSIT...");
     /// let amount = 1000_0000000; // 1000 USDC
     /// let deadline = env.ledger().timestamp() + (30 * 24 * 60 * 60); // 30 days
-    /// 
+    ///
     /// escrow_client.lock_funds(&depositor, &42, &amount, &deadline)?;
     /// // Funds are now locked and can be released or refunded
     /// ```
@@ -351,16 +555,41 @@ impl BountyEscrowContract {
         amount: i128,
         deadline: u64,
     ) -> Result<(), Error> {
+        let start = env.ledger().timestamp();
+        let caller = depositor.clone();
+
         // Verify depositor authorization
         depositor.require_auth();
 
         // Ensure contract is initialized
+        if env.storage().instance().has(&DataKey::ReentrancyGuard) {
+            panic!("Reentrancy detected");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::ReentrancyGuard, &true);
+
+        if amount <= 0 {
+            monitoring::track_operation(&env, symbol_short!("lock"), caller, false);
+            env.storage().instance().remove(&DataKey::ReentrancyGuard);
+            return Err(Error::InvalidAmount);
+        }
+
+        if deadline <= env.ledger().timestamp() {
+            monitoring::track_operation(&env, symbol_short!("lock"), caller, false);
+            env.storage().instance().remove(&DataKey::ReentrancyGuard);
+            return Err(Error::InvalidDeadline);
+        }
         if !env.storage().instance().has(&DataKey::Admin) {
+            monitoring::track_operation(&env, symbol_short!("lock"), caller, false);
+            env.storage().instance().remove(&DataKey::ReentrancyGuard);
             return Err(Error::NotInitialized);
         }
 
         // Prevent duplicate bounty IDs
         if env.storage().persistent().has(&DataKey::Escrow(bounty_id)) {
+            monitoring::track_operation(&env, symbol_short!("lock"), caller, false);
+            env.storage().instance().remove(&DataKey::ReentrancyGuard);
             return Err(Error::BountyExists);
         }
 
@@ -380,8 +609,10 @@ impl BountyEscrowContract {
         };
 
         // Store in persistent storage with extended TTL
-        env.storage().persistent().set(&DataKey::Escrow(bounty_id), &escrow);
-        
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(bounty_id), &escrow);
+
         // Emit event for off-chain indexing
         emit_funds_locked(
             &env,
@@ -389,9 +620,18 @@ impl BountyEscrowContract {
                 bounty_id,
                 amount,
                 depositor: depositor.clone(),
-                deadline
+                deadline,
             },
         );
+
+        env.storage().instance().remove(&DataKey::ReentrancyGuard);
+
+        // Track successful operation
+        monitoring::track_operation(&env, symbol_short!("lock"), caller, true);
+
+        // Track performance
+        let duration = env.ledger().timestamp().saturating_sub(start);
+        monitoring::emit_performance(&env, symbol_short!("lock"), duration);
 
         Ok(())
     }
@@ -433,7 +673,7 @@ impl BountyEscrowContract {
     /// ```rust
     /// // After verifying task completion off-chain:
     /// let contributor = Address::from_string("GCONTRIB...");
-    /// 
+    ///
     /// // Admin calls release
     /// escrow_client.release_funds(&42, &contributor)?;
     /// // Funds transferred to contributor, escrow marked as Released
@@ -449,8 +689,17 @@ impl BountyEscrowContract {
     /// 4. Monitor release events for anomalies
     /// 5. Consider implementing release delays for high-value bounties
     pub fn release_funds(env: Env, bounty_id: u64, contributor: Address) -> Result<(), Error> {
+        let start = env.ledger().timestamp();
+
         // Ensure contract is initialized
+        if env.storage().instance().has(&DataKey::ReentrancyGuard) {
+            panic!("Reentrancy detected");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::ReentrancyGuard, &true);
         if !env.storage().instance().has(&DataKey::Admin) {
+            env.storage().instance().remove(&DataKey::ReentrancyGuard);
             return Err(Error::NotInitialized);
         }
 
@@ -460,24 +709,38 @@ impl BountyEscrowContract {
 
         // Verify bounty exists
         if !env.storage().persistent().has(&DataKey::Escrow(bounty_id)) {
+            monitoring::track_operation(&env, symbol_short!("release"), admin.clone(), false);
+            env.storage().instance().remove(&DataKey::ReentrancyGuard);
             return Err(Error::BountyNotFound);
         }
 
         // Get and verify escrow state
-        let mut escrow: Escrow = env.storage().persistent().get(&DataKey::Escrow(bounty_id)).unwrap();
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(bounty_id))
+            .unwrap();
 
         if escrow.status != EscrowStatus::Locked {
+            monitoring::track_operation(&env, symbol_short!("release"), admin.clone(), false);
+            env.storage().instance().remove(&DataKey::ReentrancyGuard);
             return Err(Error::FundsNotLocked);
         }
 
         // Transfer funds to contributor
         let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
         let client = token::Client::new(&env, &token_addr);
-        client.transfer(&env.current_contract_address(), &contributor, &escrow.amount);
-
-        // Update escrow status
         escrow.status = EscrowStatus::Released;
-        env.storage().persistent().set(&DataKey::Escrow(bounty_id), &escrow);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(bounty_id), &escrow);
+
+        // Transfer funds to contributor
+        client.transfer(
+            &env.current_contract_address(),
+            &contributor,
+            &escrow.amount,
+        );
 
         // Emit release event
         emit_funds_released(
@@ -486,10 +749,18 @@ impl BountyEscrowContract {
                 bounty_id,
                 amount: escrow.amount,
                 recipient: contributor.clone(),
-                timestamp: env.ledger().timestamp()
+                timestamp: env.ledger().timestamp(),
             },
         );
 
+        env.storage().instance().remove(&DataKey::ReentrancyGuard);
+
+        // Track successful operation
+        monitoring::track_operation(&env, symbol_short!("release"), admin, true);
+
+        // Track performance
+        let duration = env.ledger().timestamp().saturating_sub(start);
+        monitoring::emit_performance(&env, symbol_short!("release"), duration);
         Ok(())
     }
 
@@ -534,7 +805,7 @@ impl BountyEscrowContract {
     /// ```rust
     /// // Deadline was January 1, 2025
     /// // Current time: January 15, 2025
-    /// 
+    ///
     /// // Anyone can call refund now
     /// escrow_client.refund(&42)?;
     /// // Funds returned to original depositor
@@ -547,37 +818,70 @@ impl BountyEscrowContract {
     /// ```rust
     /// // Set deadline for 30 days from now
     /// let deadline = env.ledger().timestamp() + (30 * 24 * 60 * 60);
-    /// 
+    ///
     /// // After deadline passes, refund becomes available
     /// // Current time must be > deadline
     /// ```
     pub fn refund(env: Env, bounty_id: u64) -> Result<(), Error> {
+        let start = env.ledger().timestamp();
+
+        if env.storage().instance().has(&DataKey::ReentrancyGuard) {
+            panic!("Reentrancy detected");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::ReentrancyGuard, &true);
+
+        // We'll allow anyone to trigger the refund if conditions are met,
+        // effectively making it permissionless but conditional.
+        // OR we can require depositor auth. Let's make it permissionless to ensure funds aren't stuck if depositor key is lost,
+        // but strictly logic bound.
+        // However, usually refund is triggered by depositor. Let's stick to logic.
+
         // Verify bounty exists
         if !env.storage().persistent().has(&DataKey::Escrow(bounty_id)) {
+            let caller = env.current_contract_address();
+            monitoring::track_operation(&env, symbol_short!("refund"), caller, false);
+            env.storage().instance().remove(&DataKey::ReentrancyGuard);
             return Err(Error::BountyNotFound);
         }
 
         // Get and verify escrow state
-        let mut escrow: Escrow = env.storage().persistent().get(&DataKey::Escrow(bounty_id)).unwrap();
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(bounty_id))
+            .unwrap();
+        let caller = escrow.depositor.clone();
 
         if escrow.status != EscrowStatus::Locked {
+            monitoring::track_operation(&env, symbol_short!("refund"), caller, false);
+            env.storage().instance().remove(&DataKey::ReentrancyGuard);
             return Err(Error::FundsNotLocked);
         }
 
         // Verify deadline has passed
         let now = env.ledger().timestamp();
         if now < escrow.deadline {
+            monitoring::track_operation(&env, symbol_short!("refund"), caller, false);
+            env.storage().instance().remove(&DataKey::ReentrancyGuard);
             return Err(Error::DeadlineNotPassed);
         }
 
         // Transfer funds back to depositor
         let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
         let client = token::Client::new(&env, &token_addr);
-        client.transfer(&env.current_contract_address(), &escrow.depositor, &escrow.amount);
-
-        // Update escrow status
         escrow.status = EscrowStatus::Refunded;
-        env.storage().persistent().set(&DataKey::Escrow(bounty_id), &escrow);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(bounty_id), &escrow);
+
+        // Transfer funds back to depositor
+        client.transfer(
+            &env.current_contract_address(),
+            &escrow.depositor,
+            &escrow.amount,
+        );
 
         // Emit refund event
         emit_funds_refunded(
@@ -585,10 +889,19 @@ impl BountyEscrowContract {
             FundsRefunded {
                 bounty_id,
                 amount: escrow.amount,
-                refund_to: escrow.depositor,
-                timestamp: env.ledger().timestamp()
+                refund_to: escrow.depositor.clone(),
+                timestamp: env.ledger().timestamp(),
             },
         );
+
+        env.storage().instance().remove(&DataKey::ReentrancyGuard);
+
+        // Track successful operation
+        monitoring::track_operation(&env, symbol_short!("refund"), caller, true);
+
+        // Track performance
+        let duration = env.ledger().timestamp().saturating_sub(start);
+        monitoring::emit_performance(&env, symbol_short!("refund"), duration);
 
         Ok(())
     }
@@ -621,7 +934,11 @@ impl BountyEscrowContract {
         if !env.storage().persistent().has(&DataKey::Escrow(bounty_id)) {
             return Err(Error::BountyNotFound);
         }
-        Ok(env.storage().persistent().get(&DataKey::Escrow(bounty_id)).unwrap())
+        Ok(env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(bounty_id))
+            .unwrap())
     }
 
     /// Returns the current token balance held by the contract.
@@ -653,6 +970,30 @@ impl BountyEscrowContract {
         let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
         let client = token::Client::new(&env, &token_addr);
         Ok(client.balance(&env.current_contract_address()))
+    }
+
+    // ========================================================================
+    // Monitoring & Analytics Functions
+    // ========================================================================
+
+    /// Health check - returns contract health status
+    pub fn health_check(env: Env) -> monitoring::HealthStatus {
+        monitoring::health_check(&env)
+    }
+
+    /// Get analytics - returns usage analytics
+    pub fn get_analytics(env: Env) -> monitoring::Analytics {
+        monitoring::get_analytics(&env)
+    }
+
+    /// Get state snapshot - returns current state
+    pub fn get_state_snapshot(env: Env) -> monitoring::StateSnapshot {
+        monitoring::get_state_snapshot(&env)
+    }
+
+    /// Get performance stats for a function
+    pub fn get_performance_stats(env: Env, function_name: Symbol) -> monitoring::PerformanceStats {
+        monitoring::get_performance_stats(&env, function_name)
     }
 }
 
