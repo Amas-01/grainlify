@@ -310,25 +310,6 @@
                     },
                     {
                       "key": {
-                        "symbol": "refund_history"
-                      },
-                      "val": {
-                        "vec": []
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "remaining_amount"
-                      },
-                      "val": {
-                        "i128": {
-                          "hi": 0,
-                          "lo": 1000
-                        }
-                      }
-                    },
-                    {
-                      "key": {
                         "symbol": "status"
                       },
                       "val": {
