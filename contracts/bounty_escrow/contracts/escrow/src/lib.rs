@@ -588,8 +588,8 @@ pub struct ReleaseHistory {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReleaseType {
-    Automatic,  // Released automatically after timestamp
-    Manual,     // Released manually by authorized party
+    Automatic, // Released automatically after timestamp
+    Manual,    // Released manually by authorized party
 }
 
 /// Event emitted when a release schedule is created.
@@ -686,8 +686,8 @@ pub enum DataKey {
     RefundApproval(u64), // bounty_id -> RefundApproval
     ReentrancyGuard,
     ReleaseSchedule(u64, u64), // bounty_id, schedule_id -> ReleaseSchedule
-    ReleaseHistory(u64), // bounty_id -> Vec<ReleaseHistory>
-    NextScheduleId(u64), // bounty_id -> next schedule_id
+    ReleaseHistory(u64),       // bounty_id -> Vec<ReleaseHistory>
+    NextScheduleId(u64),       // bounty_id -> next schedule_id
 }
 
 // ============================================================================
@@ -1827,13 +1827,13 @@ impl BountyEscrowContract {
     pub fn get_pending_schedules(env: Env, bounty_id: u64) -> Vec<ReleaseSchedule> {
         let all_schedules = Self::get_all_release_schedules(env.clone(), bounty_id);
         let mut pending = Vec::new(&env);
-        
+
         for schedule in all_schedules.iter() {
             if !schedule.released {
                 pending.push_back(schedule.clone());
             }
         }
-        
+
         pending
     }
 
@@ -1849,13 +1849,13 @@ impl BountyEscrowContract {
         let pending = Self::get_pending_schedules(env.clone(), bounty_id);
         let mut due = Vec::new(&env);
         let now = env.ledger().timestamp();
-        
+
         for schedule in pending.iter() {
             if schedule.release_timestamp <= now {
                 due.push_back(schedule.clone());
             }
         }
-        
+
         due
     }
 
