@@ -583,10 +583,10 @@ const MAX_BATCH_SIZE: u32 = 100;
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FeeConfig {
-    pub lock_fee_rate: i128,      // Fee rate for lock operations (basis points, e.g., 100 = 1%)
-    pub release_fee_rate: i128,   // Fee rate for release operations (basis points)
-    pub fee_recipient: Address,    // Address to receive fees
-    pub fee_enabled: bool,         // Global fee enable/disable flag
+    pub lock_fee_rate: i128, // Fee rate for lock operations (basis points, e.g., 100 = 1%)
+    pub release_fee_rate: i128, // Fee rate for release operations (basis points)
+    pub fee_recipient: Address, // Address to receive fees
+    pub fee_enabled: bool,   // Global fee enable/disable flag
 }
 
 // Fee rate is stored in basis points (1 basis point = 0.01%)
@@ -598,8 +598,8 @@ const MAX_FEE_RATE: i128 = 1_000; // Maximum 10% fee
 pub enum DataKey {
     Admin,
     Token,
-    Escrow(u64), // bounty_id
-    FeeConfig,   // Fee configuration
+    Escrow(u64),         // bounty_id
+    FeeConfig,           // Fee configuration
     RefundApproval(u64), // bounty_id -> RefundApproval
     ReentrancyGuard,
 }
@@ -675,7 +675,9 @@ impl BountyEscrowContract {
             fee_recipient: admin.clone(),
             fee_enabled: false,
         };
-        env.storage().instance().set(&DataKey::FeeConfig, &fee_config);
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeConfig, &fee_config);
 
         // Emit initialization event
         emit_bounty_initialized(
@@ -762,7 +764,9 @@ impl BountyEscrowContract {
             fee_config.fee_enabled = enabled;
         }
 
-        env.storage().instance().set(&DataKey::FeeConfig, &fee_config);
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeConfig, &fee_config);
 
         events::emit_fee_config_updated(
             &env,
@@ -1072,7 +1076,11 @@ impl BountyEscrowContract {
 
         // Transfer fee to fee recipient if applicable
         if fee_amount > 0 {
-            client.transfer(&env.current_contract_address(), &fee_config.fee_recipient, &fee_amount);
+            client.transfer(
+                &env.current_contract_address(),
+                &fee_config.fee_recipient,
+                &fee_amount,
+            );
             events::emit_fee_collected(
                 &env,
                 events::FeeCollected {
@@ -1086,7 +1094,9 @@ impl BountyEscrowContract {
         }
 
         escrow.status = EscrowStatus::Released;
-        env.storage().persistent().set(&DataKey::Escrow(bounty_id), &escrow);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(bounty_id), &escrow);
         // Transfer funds to contributor
         client.transfer(
             &env.current_contract_address(),

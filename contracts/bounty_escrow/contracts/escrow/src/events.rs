@@ -305,7 +305,7 @@ pub struct FeeCollected {
 }
 
 pub fn emit_fee_collected(env: &Env, event: FeeCollected) {
-    let topics = (symbol_short!("fee"), );
+    let topics = (symbol_short!("fee"),);
     env.events().publish(topics, event.clone());
 }
 
@@ -333,7 +333,7 @@ pub struct FeeConfigUpdated {
 }
 
 pub fn emit_fee_config_updated(env: &Env, event: FeeConfigUpdated) {
-    let topics = (symbol_short!("fee_cfg"), );
+    let topics = (symbol_short!("fee_cfg"),);
     env.events().publish(topics, event.clone());
 }
 
