@@ -227,6 +227,7 @@ func New(cfg config.Config, deps Deps) *fiber.App {
 
 	issueApps := handlers.NewIssueApplicationsHandler(cfg, deps.DB)
 	app.Post("/projects/:id/issues/:number/apply", auth.RequireAuth(cfg.JWTSecret), issueApps.Apply())
+	app.Post("/projects/:id/issues/:number/bot-comment", auth.RequireAuth(cfg.JWTSecret), issueApps.PostBotComment())
 
 	admin := handlers.NewAdminHandler(cfg, deps.DB)
 	adminGroup := app.Group("/admin", auth.RequireAuth(cfg.JWTSecret))

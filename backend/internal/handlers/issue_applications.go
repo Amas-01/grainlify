@@ -2,11 +2,13 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"strings"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/jagadeesh/grainlify/backend/internal/auth"
 	"github.com/jagadeesh/grainlify/backend/internal/config"
@@ -117,6 +119,119 @@ LIMIT 1
 		}
 
 		// Persist the comment into our DB so maintainers see it immediately.
+		commentJSON, _ := json.Marshal(ghComment)
+		_, _ = h.db.Pool.Exec(c.Context(), `
+UPDATE github_issues
+SET comments = COALESCE(comments, '[]'::jsonb) || $3::jsonb,
+    comments_count = COALESCE(comments_count, 0) + 1,
+    updated_at_github = $4,
+    last_seen_at = now()
+WHERE project_id = $1 AND number = $2
+`, projectID, issueNumber, commentJSON, ghComment.UpdatedAt)
+
+		return c.Status(fiber.StatusOK).JSON(fiber.Map{
+			"ok": true,
+			"comment": fiber.Map{
+				"id": ghComment.ID,
+				"body": ghComment.Body,
+				"user": fiber.Map{"login": ghComment.User.Login},
+				"created_at": ghComment.CreatedAt,
+				"updated_at": ghComment.UpdatedAt,
+			},
+		})
+	}
+}
+
+type botCommentRequest struct {
+	Body string `json:"body"`
+}
+
+// PostBotComment posts a comment on a GitHub issue as the Grainlify GitHub App (bot).
+// Requires project maintainer (owner) or admin. Project must have GitHub App installed.
+func (h *IssueApplicationsHandler) PostBotComment() fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		if h.db == nil || h.db.Pool == nil {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "db_not_configured"})
+		}
+		if strings.TrimSpace(h.cfg.GitHubAppID) == "" || strings.TrimSpace(h.cfg.GitHubAppPrivateKey) == "" {
+			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"error": "github_app_not_configured"})
+		}
+
+		projectID, err := uuid.Parse(c.Params("id"))
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid_project_id"})
+		}
+		issueNumber, err := c.ParamsInt("number")
+		if err != nil || issueNumber <= 0 {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid_issue_number"})
+		}
+
+		userIDStr, _ := c.Locals(auth.LocalUserID).(string)
+		userID, err := uuid.Parse(userIDStr)
+		if err != nil {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "invalid_user"})
+		}
+		role, _ := c.Locals(auth.LocalRole).(string)
+
+		var req botCommentRequest
+		if err := c.BodyParser(&req); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid_body"})
+		}
+		req.Body = strings.TrimSpace(req.Body)
+		if req.Body == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "body_required"})
+		}
+		if len(req.Body) > 32000 {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "body_too_long"})
+		}
+
+		var owner uuid.UUID
+		var fullName, installationID string
+		err = h.db.Pool.QueryRow(c.Context(), `
+SELECT owner_user_id, github_full_name, COALESCE(github_app_installation_id, '')
+FROM projects
+WHERE id = $1 AND status = 'verified' AND deleted_at IS NULL
+`, projectID).Scan(&owner, &fullName, &installationID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "project_not_found"})
+		}
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "project_lookup_failed"})
+		}
+		if owner != userID && role != "admin" {
+			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "forbidden"})
+		}
+		if installationID == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "project_has_no_github_app_installation"})
+		}
+
+		appClient, err := github.NewGitHubAppClient(h.cfg.GitHubAppID, h.cfg.GitHubAppPrivateKey)
+		if err != nil {
+			slog.Error("failed to create GitHub App client for bot comment", "error", err)
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "github_app_client_failed"})
+		}
+		token, err := appClient.GetInstallationToken(c.Context(), installationID)
+		if err != nil {
+			slog.Warn("failed to get installation token for bot comment",
+				"project_id", projectID.String(),
+				"installation_id", installationID,
+				"error", err,
+			)
+			return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "installation_token_failed"})
+		}
+
+		gh := github.NewClient()
+		ghComment, err := gh.CreateIssueComment(c.Context(), token, fullName, issueNumber, req.Body)
+		if err != nil {
+			slog.Warn("failed to post bot comment on GitHub",
+				"project_id", projectID.String(),
+				"issue_number", issueNumber,
+				"github_full_name", fullName,
+				"error", err,
+			)
+			return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "github_comment_create_failed"})
+		}
+
 		commentJSON, _ := json.Marshal(ghComment)
 		_, _ = h.db.Pool.Exec(c.Context(), `
 UPDATE github_issues

@@ -912,3 +912,23 @@ export const applyToIssue = (
     method: "POST",
     body: JSON.stringify({ message }),
   });
+
+export const postBotComment = (
+  projectId: string,
+  issueNumber: number,
+  body: string,
+) =>
+  apiRequest<{
+    ok: boolean;
+    comment: {
+      id: number;
+      body: string;
+      user: { login: string };
+      created_at: string;
+      updated_at: string;
+    };
+  }>(`/projects/${projectId}/issues/${issueNumber}/bot-comment`, {
+    requiresAuth: true,
+    method: "POST",
+    body: JSON.stringify({ body }),
+  });

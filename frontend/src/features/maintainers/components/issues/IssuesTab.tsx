@@ -6,7 +6,7 @@ import { Issue } from '../../types';
 import { EmptyIssueState } from './EmptyIssueState';
 import { IssueCard } from '../../../../shared/components/ui/IssueCard';
 import { Modal, ModalFooter, ModalButton } from '../../../../shared/components/ui/Modal';
-import { applyToIssue, getProjectIssues } from '../../../../shared/api/client';
+import { applyToIssue, getProjectIssues, postBotComment } from '../../../../shared/api/client';
 import { formatDistanceToNow } from 'date-fns';
 import { IssueCardSkeleton } from '../../../../shared/components/IssueCardSkeleton';
 import RenderMarkdownContent from '../../../../app/utils/renderMarkdown';
@@ -78,6 +78,10 @@ export function IssuesTab({ onNavigate, selectedProjects, onRefresh, initialSele
   const [isSubmittingApplication, setIsSubmittingApplication] = useState(false);
   const [applicationError, setApplicationError] = useState<string | null>(null);
   const [applyModalOpen, setApplyModalOpen] = useState(false);
+  const [botCommentModalOpen, setBotCommentModalOpen] = useState(false);
+  const [botCommentDraft, setBotCommentDraft] = useState('');
+  const [botCommentError, setBotCommentError] = useState<string | null>(null);
+  const [isPostingBotComment, setIsPostingBotComment] = useState(false);
   const [issues, setIssues] = useState<Array<IssueFromAPI & { projectName: string; projectId: string }>>([]);
   const [isLoadingIssues, setIsLoadingIssues] = useState(true);
   const filterBtnRef = useRef<HTMLButtonElement | null>(null);
@@ -234,6 +238,10 @@ export function IssuesTab({ onNavigate, selectedProjects, onRefresh, initialSele
   };
 
   const GRAINLIFY_APP_PREFIX = '[grainlify application]';
+
+  const DEFAULT_BOT_MESSAGE = `This issue has been added to the Grainlify program. Interested in contributing? **Apply to work on this issue on Grainlify**, earn points, and receive rewards.
+
+Only applications submitted via the apply link above will be considered. Please do not apply by commenting on the issue or opening a PR directly.`;
 
   const countApplicationComments = (comments: Array<{ body?: string | null }> | null | undefined): number => {
     if (!Array.isArray(comments)) return 0;
@@ -718,136 +726,42 @@ export function IssuesTab({ onNavigate, selectedProjects, onRefresh, initialSele
             {/* Content */}
             {issueDetailTab === 'applications' && (
               <>
-                {/* Apply Composer (contributors only, open + unassigned issues only) */}
-                {selectedIssueFromAPI && userRole === 'contributor' && (
-                  (() => {
-                    const isOpen = (selectedIssueFromAPI.state || '').toLowerCase() === 'open';
-                    const assigneesCount = Array.isArray(selectedIssueFromAPI.assignees) ? selectedIssueFromAPI.assignees.length : 0;
-                    const unassigned = assigneesCount === 0;
-                    const notAuthor = !user?.github?.login || user.github.login.toLowerCase() !== (selectedIssueFromAPI.author_login || '').toLowerCase();
-                    const canApply = isOpen && unassigned && notAuthor;
-
-                    return (
-                      <div className={`mb-6 rounded-[16px] border p-5 transition-colors ${isDark ? 'bg-white/[0.08] border-white/10' : 'bg-white/[0.15] border-white/25'
-                        }`}>
-                        <div className={`text-[14px] font-bold mb-2 ${isDark ? 'text-[#e8dfd0]' : 'text-[#2d2820]'}`}>
+                {/* Apply CTA: button opens modal (contributors only when issue is open + unassigned + not author) */}
+                {selectedIssueFromAPI && (
+                  <div className={`mb-6 rounded-[16px] border p-5 transition-colors ${isDark ? 'bg-white/[0.08] border-white/10' : 'bg-white/[0.15] border-white/25'}`}>
+                    {userRole !== 'contributor' ? (
+                      <p className={`text-[13px] ${isDark ? 'text-[#b8a898]' : 'text-[#7a6b5a]'}`}>
+                        Sign in as a contributor to apply for this issue.
+                      </p>
+                    ) : !canApplyToSelectedIssue ? (
+                      (() => {
+                        const isOpen = (selectedIssueFromAPI.state || '').toLowerCase() === 'open';
+                        const assigneesCount = Array.isArray(selectedIssueFromAPI.assignees) ? selectedIssueFromAPI.assignees.length : 0;
+                        const unassigned = assigneesCount === 0;
+                        const notAuthor = !user?.github?.login || user.github.login.toLowerCase() !== (selectedIssueFromAPI.author_login || '').toLowerCase();
+                        if (!isOpen) return <p className={`text-[13px] ${isDark ? 'text-[#b8a898]' : 'text-[#7a6b5a]'}`}>This issue is closed. Applications are disabled.</p>;
+                        if (!unassigned) return <p className={`text-[13px] ${isDark ? 'text-[#b8a898]' : 'text-[#7a6b5a]'}`}>This issue is already assigned. Applications are disabled.</p>;
+                        if (!notAuthor) return <p className={`text-[13px] ${isDark ? 'text-[#b8a898]' : 'text-[#7a6b5a]'}`}>You can't apply to your own issue.</p>;
+                        return null;
+                      })()
+                    ) : (
+                      <div className="flex items-center justify-between gap-4">
+                        <p className={`text-[13px] ${isDark ? 'text-[#e8dfd0]' : 'text-[#2d2820]'}`}>
+                          Interested in contributing? Apply to work on this issue; your message will be posted as a comment on GitHub.
+                        </p>
+                        <button
+                          type="button"
+                          onClick={() => { setApplicationError(null); setApplyModalOpen(true); }}
+                          className={`flex-shrink-0 px-4 py-2 rounded-[10px] text-[13px] font-semibold transition-all border ${isDark
+                            ? 'bg-gradient-to-br from-[#c9983a] to-[#a67c2e] border-white/10 text-white hover:opacity-90'
+                            : 'bg-gradient-to-br from-[#c9983a] to-[#a67c2e] border-white/10 text-white hover:opacity-90'
+                          }`}
+                        >
                           Apply for this issue
-                        </div>
-                        {!isOpen ? (
-                          <div className={`text-[13px] ${isDark ? 'text-[#b8a898]' : 'text-[#7a6b5a]'}`}>
-                            This issue is closed. Applications are disabled.
-                          </div>
-                        ) : !unassigned ? (
-                          <div className={`text-[13px] ${isDark ? 'text-[#b8a898]' : 'text-[#7a6b5a]'}`}>
-                            This issue is already assigned. Applications are disabled.
-                          </div>
-                        ) : !notAuthor ? (
-                          <div className={`text-[13px] ${isDark ? 'text-[#b8a898]' : 'text-[#7a6b5a]'}`}>
-                            You can’t apply to your own issue.
-                          </div>
-                        ) : (
-                          <>
-                            <textarea
-                              value={applicationDraft}
-                              onChange={(e) => setApplicationDraft(e.target.value)}
-                              placeholder="Write your application message…"
-                              className={`w-full min-h-[110px] rounded-[12px] border px-4 py-3 text-[13px] outline-none transition-colors ${isDark
-                                ? 'bg-white/[0.06] border-white/15 text-[#e8dfd0] placeholder:text-[#b8a898]/60'
-                                : 'bg-white/[0.25] border-white/30 text-[#2d2820] placeholder:text-[#7a6b5a]/70'
-                                }`}
-                            />
-                            {applicationError && (
-                              <div className="mt-2 text-[12px] font-semibold text-red-400">
-                                {applicationError}
-                              </div>
-                            )}
-                            <div className="mt-3 flex items-center justify-end">
-                              <button
-                                disabled={isSubmittingApplication || applicationDraft.trim().length === 0}
-                                onClick={async () => {
-                                  try {
-                                    setApplicationError(null);
-                                    setIsSubmittingApplication(true);
-                                    const res = await applyToIssue(
-                                      selectedIssueFromAPI.projectId,
-                                      selectedIssueFromAPI.number,
-                                      applicationDraft.trim()
-                                    );
-                                    const newComment = res.comment;
-
-                                    // Update selected issue API payload (so Applications/Discussions refresh immediately)
-                                    setSelectedIssueFromAPI((prev) => {
-                                      if (!prev) return prev;
-                                      return {
-                                        ...prev,
-                                        comments_count: (prev.comments_count || 0) + 1,
-                                        comments: [
-                                          ...(prev.comments || []),
-                                          {
-                                            id: newComment.id,
-                                            body: newComment.body,
-                                            user: { login: newComment.user.login },
-                                            created_at: newComment.created_at,
-                                            updated_at: newComment.updated_at,
-                                          } as CommentFromAPI,
-                                        ],
-                                      };
-                                    });
-
-                                    // Update the list data too (left list applicants count)
-                                    setIssues((prev) =>
-                                      prev.map((it) =>
-                                        it.github_issue_id === selectedIssueFromAPI.github_issue_id && it.projectId === selectedIssueFromAPI.projectId
-                                          ? {
-                                            ...it,
-                                            comments_count: (it.comments_count || 0) + 1,
-                                            comments: [
-                                              ...(it.comments || []),
-                                              {
-                                                id: newComment.id,
-                                                body: newComment.body,
-                                                user: { login: newComment.user.login },
-                                                created_at: newComment.created_at,
-                                                updated_at: newComment.updated_at,
-                                              } as any,
-                                            ],
-                                          }
-                                          : it
-                                      )
-                                    );
-
-                                    setSelectedIssue((prev) => {
-                                      if (!prev) return prev;
-                                      return {
-                                        ...prev,
-                                        applicants: (prev.applicants || 0) + 1,
-                                        comments: (prev.comments || 0) + 1,
-                                      };
-                                    });
-
-                                    setApplicationDraft('');
-                                  } catch (e: any) {
-                                    setApplicationError(e?.message || 'Failed to submit application');
-                                  } finally {
-                                    setIsSubmittingApplication(false);
-                                  }
-                                }}
-                                className={`px-5 py-2 rounded-[10px] text-[12px] font-semibold transition-all border ${isSubmittingApplication
-                                  ? 'opacity-70 cursor-not-allowed'
-                                  : 'hover:scale-[1.02]'
-                                  } ${isDark
-                                    ? 'bg-gradient-to-br from-[#c9983a] to-[#a67c2e] border-white/10 text-white'
-                                    : 'bg-gradient-to-br from-[#c9983a] to-[#a67c2e] border-white/10 text-white'
-                                  }`}
-                              >
-                                {isSubmittingApplication ? 'Submitting…' : 'Submit application'}
-                              </button>
-                            </div>
-                          </>
-                        )}
+                        </button>
                       </div>
-                    );
-                  })()
+                    )}
+                  </div>
                 )}
 
                 {(!applicationData || applicationData.applications.length === 0) && (
@@ -1121,6 +1035,40 @@ export function IssuesTab({ onNavigate, selectedProjects, onRefresh, initialSele
           </div>
         )}
       </div>
+
+      {/* Apply for issue modal */}
+      <Modal
+        isOpen={applyModalOpen}
+        onClose={() => { setApplyModalOpen(false); setApplicationError(null); }}
+        title="Apply for this issue"
+        width="lg"
+        footer={
+          <ModalFooter>
+            <ModalButton onClick={() => { setApplyModalOpen(false); setApplicationError(null); }}>Cancel</ModalButton>
+            <ModalButton variant="primary" disabled={isSubmittingApplication || !applicationDraft.trim()} onClick={handleSubmitApplication}>
+              {isSubmittingApplication ? 'Submitting…' : 'Submit application'}
+            </ModalButton>
+          </ModalFooter>
+        }
+      >
+        <p className={`text-[13px] mb-3 ${isDark ? 'text-[#b8a898]' : 'text-[#7a6b5a]'}`}>
+          Your message will be posted as a comment on the GitHub issue with the prefix &quot;[grainlify application]&quot;.
+        </p>
+        <textarea
+          value={applicationDraft}
+          onChange={(e) => setApplicationDraft(e.target.value)}
+          placeholder="Write your application message…"
+          className={`w-full min-h-[120px] rounded-[12px] border px-4 py-3 text-[13px] outline-none transition-colors ${isDark
+            ? 'bg-white/[0.06] border-white/15 text-[#e8dfd0] placeholder:text-[#b8a898]/60'
+            : 'bg-white/[0.25] border-white/30 text-[#2d2820] placeholder:text-[#7a6b5a]/70'
+            }`}
+        />
+        {applicationError && (
+          <div className="mt-2 text-[12px] font-semibold text-red-400">
+            {applicationError}
+          </div>
+        )}
+      </Modal>
 
       {/* Filter Modal */}
       {isFilterModalOpen && (
