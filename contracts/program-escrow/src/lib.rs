@@ -672,6 +672,25 @@ pub enum DataKey {
     ReleaseSchedule(String, u64), // program_id, schedule_id -> ProgramReleaseSchedule
     ReleaseHistory(String), // program_id -> Vec<ProgramReleaseHistory>
     NextScheduleId(String), // program_id -> next schedule_id
+    MultisigConfig(String), // program_id -> MultisigConfig
+    PayoutApproval(String, Address), // program_id, recipient -> PayoutApproval
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultisigConfig {
+    pub threshold_amount: i128,
+    pub signers: Vec<Address>,
+    pub required_signatures: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PayoutApproval {
+    pub program_id: String,
+    pub recipient: Address,
+    pub amount: i128,
+    pub approvals: Vec<Address>,
 }
 
 // ============================================================================
@@ -804,6 +823,16 @@ impl ProgramEscrowContract {
 
         // Store program data
         env.storage().instance().set(&program_key, &program_data);
+
+        // Initialize multisig config (disabled by default)
+        let multisig_config = MultisigConfig {
+            threshold_amount: i128::MAX,
+            signers: vec![&env],
+            required_signatures: 0,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::MultisigConfig(program_id.clone()), &multisig_config);
 
         // Update registry
         let mut registry: Vec<String> = env
@@ -1160,9 +1189,6 @@ impl ProgramEscrowContract {
         // Apply rate limiting to the authorized payout key
         anti_abuse::check_rate_limit(&env, program_data.authorized_payout_key.clone());
 
-        // Verify authorization - CRITICAL
-        program_data.authorized_payout_key.require_auth();
-
         // Validate inputs
         if recipients.len() != amounts.len() {
             panic!("Recipients and amounts vectors must have the same length");
@@ -1192,6 +1218,40 @@ impl ProgramEscrowContract {
             );
         }
 
+        // Check if multisig approval is required for any payout
+        let multisig_config: MultisigConfig = Self::get_multisig_config(env.clone(), program_id.clone());
+        let mut requires_multisig = false;
+        
+        for i in 0..amounts.len() {
+            let amount = amounts.get(i).unwrap();
+            if amount >= multisig_config.threshold_amount && multisig_config.required_signatures > 0 {
+                requires_multisig = true;
+                
+                // Verify approval for this recipient
+                let recipient = recipients.get(i).unwrap();
+                let approval_key = DataKey::PayoutApproval(program_id.clone(), recipient.clone());
+                
+                if !env.storage().persistent().has(&approval_key) {
+                    panic!("Multisig approval required for large payout");
+                }
+                
+                let approval: PayoutApproval = env
+                    .storage()
+                    .persistent()
+                    .get(&approval_key)
+                    .unwrap();
+                
+                if approval.approvals.len() < multisig_config.required_signatures {
+                    panic!("Insufficient approvals for large payout");
+                }
+            }
+        }
+
+        // Require auth from authorized key if no multisig needed
+        if !requires_multisig {
+            program_data.authorized_payout_key.require_auth();
+        }
+
         // Calculate fees if enabled
         let fee_config = Self::get_fee_config_internal(&env);
         let mut total_fees: i128 = 0;
@@ -1205,6 +1265,12 @@ impl ProgramEscrowContract {
         for i in 0..recipients.len() {
             let recipient = recipients.get(i).unwrap();
             let amount = amounts.get(i).unwrap();
+            
+            // Clear approval if it was used
+            if amount >= multisig_config.threshold_amount && multisig_config.required_signatures > 0 {
+                let approval_key = DataKey::PayoutApproval(program_id.clone(), recipient.clone());
+                env.storage().persistent().remove(&approval_key);
+            }
             
             // Calculate fee for this payout
             let fee_amount = if fee_config.fee_enabled && fee_config.payout_fee_rate > 0 {
@@ -1334,16 +1400,8 @@ impl ProgramEscrowContract {
             .get(&program_key)
             .unwrap_or_else(|| panic!("Program not found"));
 
-        program_data.authorized_payout_key.require_auth();
         // Apply rate limiting to the authorized payout key
         anti_abuse::check_rate_limit(&env, program_data.authorized_payout_key.clone());
-
-       
-        // Verify authorization
-        // let caller = env.invoker();
-        // if caller != program_data.authorized_payout_key {
-        //     panic!("Unauthorized: only authorized payout key can trigger payouts");
-        // }
 
         // Validate amount
         if amount <= 0 {
@@ -1356,6 +1414,34 @@ impl ProgramEscrowContract {
                 "Insufficient balance: requested {}, available {}",
                 amount, program_data.remaining_balance
             );
+        }
+
+        // Check if multisig approval is required
+        let multisig_config: MultisigConfig = Self::get_multisig_config(env.clone(), program_id.clone());
+        
+        if amount >= multisig_config.threshold_amount && multisig_config.required_signatures > 0 {
+            // Large payout - requires multisig approval
+            let approval_key = DataKey::PayoutApproval(program_id.clone(), recipient.clone());
+            
+            if !env.storage().persistent().has(&approval_key) {
+                panic!("Multisig approval required for large payout");
+            }
+            
+            let approval: PayoutApproval = env
+                .storage()
+                .persistent()
+                .get(&approval_key)
+                .unwrap();
+            
+            if approval.approvals.len() < multisig_config.required_signatures {
+                panic!("Insufficient approvals for large payout");
+            }
+            
+            // Clear approval after use
+            env.storage().persistent().remove(&approval_key);
+        } else {
+            // Small payout - single authorized key approval
+            program_data.authorized_payout_key.require_auth();
         }
 
         // Calculate and collect fee if enabled
@@ -1961,6 +2047,101 @@ impl ProgramEscrowContract {
     /// Get current fee configuration (view function)
     pub fn get_fee_config(env: Env) -> FeeConfig {
         Self::get_fee_config_internal(&env)
+    }
+
+    /// Update multisig configuration for a program (authorized payout key only)
+    pub fn update_multisig_config(
+        env: Env,
+        program_id: String,
+        threshold_amount: i128,
+        signers: Vec<Address>,
+        required_signatures: u32,
+    ) {
+        let program_key = DataKey::Program(program_id.clone());
+        let program_data: ProgramData = env
+            .storage()
+            .instance()
+            .get(&program_key)
+            .unwrap_or_else(|| panic!("Program not found"));
+
+        program_data.authorized_payout_key.require_auth();
+
+        if required_signatures > signers.len() {
+            panic!("Required signatures cannot exceed number of signers");
+        }
+
+        let config = MultisigConfig {
+            threshold_amount,
+            signers,
+            required_signatures,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MultisigConfig(program_id), &config);
+    }
+
+    /// Get multisig configuration for a program
+    pub fn get_multisig_config(env: Env, program_id: String) -> MultisigConfig {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MultisigConfig(program_id))
+            .unwrap_or(MultisigConfig {
+                threshold_amount: i128::MAX,
+                signers: vec![&env],
+                required_signatures: 0,
+            })
+    }
+
+    /// Approve large payout (requires multisig)
+    pub fn approve_large_payout(
+        env: Env,
+        program_id: String,
+        recipient: Address,
+        amount: i128,
+        approver: Address,
+    ) {
+        let multisig_config: MultisigConfig = Self::get_multisig_config(env.clone(), program_id.clone());
+        
+        let mut is_signer = false;
+        for signer in multisig_config.signers.iter() {
+            if signer == approver {
+                is_signer = true;
+                break;
+            }
+        }
+        
+        if !is_signer {
+            panic!("Caller is not an authorized signer");
+        }
+
+        approver.require_auth();
+
+        let approval_key = DataKey::PayoutApproval(program_id.clone(), recipient.clone());
+        let mut approval: PayoutApproval = env
+            .storage()
+            .persistent()
+            .get(&approval_key)
+            .unwrap_or(PayoutApproval {
+                program_id: program_id.clone(),
+                recipient: recipient.clone(),
+                amount,
+                approvals: vec![&env],
+            });
+
+        for existing in approval.approvals.iter() {
+            if existing == approver {
+                return;
+            }
+        }
+
+        approval.approvals.push_back(approver.clone());
+        env.storage().persistent().set(&approval_key, &approval);
+
+        env.events().publish(
+            (symbol_short!("approval"),),
+            (program_id, recipient, amount, approver),
+        );
     }
 
     /// Gets the total number of programs registered.

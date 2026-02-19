@@ -595,6 +595,22 @@ const BASIS_POINTS: i128 = 10_000;
 const MAX_FEE_RATE: i128 = 1_000; // Maximum 10% fee
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultisigConfig {
+    pub threshold_amount: i128,
+    pub signers: Vec<Address>,
+    pub required_signatures: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReleaseApproval {
+    pub bounty_id: u64,
+    pub contributor: Address,
+    pub approvals: Vec<Address>,
+}
+
+#[contracttype]
 pub enum DataKey {
     Admin,
     Token,
@@ -602,6 +618,8 @@ pub enum DataKey {
     FeeConfig,           // Fee configuration
     RefundApproval(u64), // bounty_id -> RefundApproval
     ReentrancyGuard,
+    MultisigConfig,
+    ReleaseApproval(u64), // bounty_id -> ReleaseApproval
 }
 
 // ============================================================================
@@ -678,6 +696,16 @@ impl BountyEscrowContract {
         env.storage()
             .instance()
             .set(&DataKey::FeeConfig, &fee_config);
+
+        // Initialize multisig config (disabled by default)
+        let multisig_config = MultisigConfig {
+            threshold_amount: i128::MAX,
+            signers: vec![&env],
+            required_signatures: 0,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::MultisigConfig, &multisig_config);
 
         // Emit initialization event
         emit_bounty_initialized(
@@ -785,6 +813,109 @@ impl BountyEscrowContract {
     /// Get current fee configuration (view function)
     pub fn get_fee_config(env: Env) -> FeeConfig {
         Self::get_fee_config_internal(&env)
+    }
+
+    /// Update multisig configuration (admin only)
+    pub fn update_multisig_config(
+        env: Env,
+        threshold_amount: i128,
+        signers: Vec<Address>,
+        required_signatures: u32,
+    ) -> Result<(), Error> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::NotInitialized);
+        }
+
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        if required_signatures > signers.len() {
+            return Err(Error::InvalidAmount);
+        }
+
+        let config = MultisigConfig {
+            threshold_amount,
+            signers,
+            required_signatures,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::MultisigConfig, &config);
+
+        Ok(())
+    }
+
+    /// Get multisig configuration
+    pub fn get_multisig_config(env: Env) -> MultisigConfig {
+        env.storage()
+            .instance()
+            .get(&DataKey::MultisigConfig)
+            .unwrap_or(MultisigConfig {
+                threshold_amount: i128::MAX,
+                signers: vec![&env],
+                required_signatures: 0,
+            })
+    }
+
+    /// Approve release for large amount (requires multisig)
+    pub fn approve_large_release(
+        env: Env,
+        bounty_id: u64,
+        contributor: Address,
+        approver: Address,
+    ) -> Result<(), Error> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::NotInitialized);
+        }
+
+        let multisig_config: MultisigConfig = Self::get_multisig_config(env.clone());
+        
+        let mut is_signer = false;
+        for signer in multisig_config.signers.iter() {
+            if signer == approver {
+                is_signer = true;
+                break;
+            }
+        }
+        
+        if !is_signer {
+            return Err(Error::Unauthorized);
+        }
+
+        approver.require_auth();
+
+        let approval_key = DataKey::ReleaseApproval(bounty_id);
+        let mut approval: ReleaseApproval = env
+            .storage()
+            .persistent()
+            .get(&approval_key)
+            .unwrap_or(ReleaseApproval {
+                bounty_id,
+                contributor: contributor.clone(),
+                approvals: vec![&env],
+            });
+
+        for existing in approval.approvals.iter() {
+            if existing == approver {
+                return Ok(());
+            }
+        }
+
+        approval.approvals.push_back(approver.clone());
+        env.storage().persistent().set(&approval_key, &approval);
+
+        events::emit_approval_added(
+            &env,
+            events::ApprovalAdded {
+                bounty_id,
+                contributor: contributor.clone(),
+                approver,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(())
     }
 
     /// Lock funds for a specific bounty.
@@ -1032,8 +1163,6 @@ impl BountyEscrowContract {
         // Apply rate limiting
         anti_abuse::check_rate_limit(&env, admin.clone());
 
-        admin.require_auth();
-
         // Verify bounty exists
         if !env.storage().persistent().has(&DataKey::Escrow(bounty_id)) {
             monitoring::track_operation(&env, symbol_short!("release"), admin.clone(), false);
@@ -1052,6 +1181,36 @@ impl BountyEscrowContract {
             monitoring::track_operation(&env, symbol_short!("release"), admin.clone(), false);
             env.storage().instance().remove(&DataKey::ReentrancyGuard);
             return Err(Error::FundsNotLocked);
+        }
+
+        // Check if multisig approval is required
+        let multisig_config: MultisigConfig = Self::get_multisig_config(env.clone());
+        
+        if escrow.amount >= multisig_config.threshold_amount && multisig_config.required_signatures > 0 {
+            // Large release - requires multisig approval
+            let approval_key = DataKey::ReleaseApproval(bounty_id);
+            
+            if !env.storage().persistent().has(&approval_key) {
+                env.storage().instance().remove(&DataKey::ReentrancyGuard);
+                return Err(Error::Unauthorized);
+            }
+            
+            let approval: ReleaseApproval = env
+                .storage()
+                .persistent()
+                .get(&approval_key)
+                .unwrap();
+            
+            if approval.approvals.len() < multisig_config.required_signatures {
+                env.storage().instance().remove(&DataKey::ReentrancyGuard);
+                return Err(Error::Unauthorized);
+            }
+            
+            // Clear approval after use
+            env.storage().persistent().remove(&approval_key);
+        } else {
+            // Small release - single admin approval
+            admin.require_auth();
         }
 
         // Transfer funds to contributor
