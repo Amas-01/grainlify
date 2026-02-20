@@ -19,6 +19,9 @@ pub enum Error {
     FundsNotLocked = 5,
     DeadlineNotPassed = 6,
     Unauthorized = 7,
+    // Added for Issue #62 – configurable min/max amount policy
+    AmountBelowMinimum = 8,
+    AmountAboveMaximum = 9,
 }
 
 #[contracttype]
@@ -493,6 +496,31 @@ impl BountyEscrowContract {
             .get(&DataKey::EscrowIndex)
             .unwrap_or(Vec::new(&env));
         index.len()
+    }
+
+    pub fn set_amount_policy(
+        env: Env,
+        caller: Address,
+        min_amount: i128,
+        max_amount: i128,
+    ) -> Result<(), Error> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::NotInitialized);
+        }
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if caller != admin {
+            return Err(Error::Unauthorized);
+        }
+        admin.require_auth();
+
+        if min_amount > max_amount {
+            panic!("invalid policy: min_amount cannot exceed max_amount");
+        }
+
+        // TODO (Issue #62): persist policy and enforce in lock_funds.
+        // env.storage().instance().set(&DataKey::AmountPolicy, &(min_amount, max_amount));
+
+        Ok(())
     }
 
     /// Get escrow IDs by status
