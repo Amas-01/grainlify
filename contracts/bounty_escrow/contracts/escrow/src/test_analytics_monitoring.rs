@@ -661,3 +661,249 @@ fn test_get_escrow_ids_by_status_empty_when_no_match() {
     assert_eq!(released_ids.len(), 0);
 }
 
+// ===========================================================================
+// 10. Refund eligibility analytics view
+// ===========================================================================
+
+#[test]
+fn test_refund_eligibility_false_before_deadline() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let depositor = Address::generate(&env);
+    let (token, token_admin) = create_token_contract(&env, &admin);
+    let escrow = create_escrow_contract(&env);
+    escrow.init(&admin, &token.address);
+    token_admin.mint(&depositor, &1_000_000);
+
+    let deadline = env.ledger().timestamp() + 2000;
+    escrow.lock_funds(&depositor, &180, &1_000, &deadline);
+
+    let (can_refund, deadline_passed, remaining, approval) =
+        escrow.get_refund_eligibility(&180);
+
+    assert!(!can_refund, "should not be eligible before deadline");
+    assert!(!deadline_passed);
+    assert_eq!(remaining, 1_000);
+    assert!(approval.is_none());
+}
+
+#[test]
+fn test_refund_eligibility_true_after_deadline_passes() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let depositor = Address::generate(&env);
+    let (token, token_admin) = create_token_contract(&env, &admin);
+    let escrow = create_escrow_contract(&env);
+    escrow.init(&admin, &token.address);
+    token_admin.mint(&depositor, &1_000_000);
+
+    let deadline = env.ledger().timestamp() + 500;
+    escrow.lock_funds(&depositor, &181, &1_000, &deadline);
+    env.ledger().set_timestamp(deadline + 1);
+
+    let (can_refund, deadline_passed, remaining, approval) =
+        escrow.get_refund_eligibility(&181);
+
+    assert!(can_refund, "should be eligible after deadline");
+    assert!(deadline_passed);
+    assert_eq!(remaining, 1_000);
+    assert!(approval.is_none());
+}
+
+#[test]
+fn test_refund_eligibility_false_after_release() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let depositor = Address::generate(&env);
+    let contributor = Address::generate(&env);
+    let (token, token_admin) = create_token_contract(&env, &admin);
+    let escrow = create_escrow_contract(&env);
+    escrow.init(&admin, &token.address);
+    token_admin.mint(&depositor, &1_000_000);
+
+    let deadline = env.ledger().timestamp() + 2000;
+    escrow.lock_funds(&depositor, &182, &1_000, &deadline);
+    escrow.release_funds(&182, &contributor);
+
+    // After release the status is Released, so can_refund must be false
+    let (can_refund, _deadline_passed, _remaining, _approval) =
+        escrow.get_refund_eligibility(&182);
+
+    assert!(!can_refund, "released escrow should not be refund-eligible");
+}
+
+#[test]
+fn test_refund_eligibility_true_with_admin_approval_before_deadline() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let depositor = Address::generate(&env);
+    let (token, token_admin) = create_token_contract(&env, &admin);
+    let escrow = create_escrow_contract(&env);
+    escrow.init(&admin, &token.address);
+    token_admin.mint(&depositor, &1_000_000);
+
+    let deadline = env.ledger().timestamp() + 5000;
+    escrow.lock_funds(&depositor, &183, &1_000, &deadline);
+
+    // Admin approves a partial refund before the deadline
+    escrow.approve_refund(&183, &500, &depositor, &RefundMode::Partial);
+
+    let (can_refund, deadline_passed, remaining, approval) =
+        escrow.get_refund_eligibility(&183);
+
+    // Approval present → eligible even before deadline
+    assert!(can_refund, "should be eligible with admin approval");
+    assert!(!deadline_passed, "deadline hasn't passed yet");
+    assert_eq!(remaining, 1_000);
+    assert!(approval.is_some());
+}
+
+// ===========================================================================
+// 11. Refund history analytics view
+// ===========================================================================
+
+#[test]
+fn test_refund_history_empty_before_any_refund() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let depositor = Address::generate(&env);
+    let (token, token_admin) = create_token_contract(&env, &admin);
+    let escrow = create_escrow_contract(&env);
+    escrow.init(&admin, &token.address);
+    token_admin.mint(&depositor, &1_000_000);
+
+    let deadline = env.ledger().timestamp() + 2000;
+    escrow.lock_funds(&depositor, &190, &1_000, &deadline);
+
+    let history = escrow.get_refund_history(&190);
+    assert_eq!(
+        history.len(),
+        0,
+        "refund history should be empty before any refund"
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")] // BountyNotFound
+fn test_refund_history_panics_for_nonexistent_bounty() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let (token, _token_admin) = create_token_contract(&env, &admin);
+    let escrow = create_escrow_contract(&env);
+    escrow.init(&admin, &token.address);
+
+    escrow.get_refund_history(&999_u64);
+}
+
+// ===========================================================================
+// 12. Event emission monitoring – operations produce events
+// ===========================================================================
+
+#[test]
+fn test_lock_emits_at_least_one_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let depositor = Address::generate(&env);
+    let (token, token_admin) = create_token_contract(&env, &admin);
+    let escrow = create_escrow_contract(&env);
+    escrow.init(&admin, &token.address);
+    token_admin.mint(&depositor, &1_000_000);
+
+    let before = env.events().all().len();
+    let deadline = env.ledger().timestamp() + 1000;
+    escrow.lock_funds(&depositor, &200, &1_000, &deadline);
+    let after = env.events().all().len();
+
+    assert!(
+        after > before,
+        "lock_funds must emit at least one monitoring event"
+    );
+}
+
+#[test]
+fn test_release_emits_at_least_one_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let depositor = Address::generate(&env);
+    let contributor = Address::generate(&env);
+    let (token, token_admin) = create_token_contract(&env, &admin);
+    let escrow = create_escrow_contract(&env);
+    escrow.init(&admin, &token.address);
+    token_admin.mint(&depositor, &1_000_000);
+
+    let deadline = env.ledger().timestamp() + 1000;
+    escrow.lock_funds(&depositor, &201, &1_000, &deadline);
+
+    let before = env.events().all().len();
+    escrow.release_funds(&201, &contributor);
+    let after = env.events().all().len();
+
+    assert!(
+        after > before,
+        "release_funds must emit at least one monitoring event"
+    );
+}
+
+#[test]
+fn test_refund_emits_at_least_one_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let depositor = Address::generate(&env);
+    let (token, token_admin) = create_token_contract(&env, &admin);
+    let escrow = create_escrow_contract(&env);
+    escrow.init(&admin, &token.address);
+    token_admin.mint(&depositor, &1_000_000);
+
+    let deadline = env.ledger().timestamp() + 500;
+    escrow.lock_funds(&depositor, &202, &1_000, &deadline);
+    env.ledger().set_timestamp(deadline + 1);
+
+    let before = env.events().all().len();
+    escrow.refund(&202);
+    let after = env.events().all().len();
+
+    assert!(
+        after > before,
+        "refund must emit at least one monitoring event"
+    );
+}
+
+#[test]
+fn test_event_count_scales_linearly_with_locks() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let depositor = Address::generate(&env);
+    let (token, token_admin) = create_token_contract(&env, &admin);
+    let escrow = create_escrow_contract(&env);
+    escrow.init(&admin, &token.address);
+    token_admin.mint(&depositor, &1_000_000);
+
+    let deadline = env.ledger().timestamp() + 1000;
+
+    let baseline = env.events().all().len();
+    escrow.lock_funds(&depositor, &210, &100, &deadline);
+    let after_first = env.events().all().len();
+    let one_lock_events = after_first - baseline;
+
+    escrow.lock_funds(&depositor, &211, &100, &deadline);
+    let after_second = env.events().all().len();
+    let two_lock_events = after_second - baseline;
+
+    // Each lock should produce the same number of events
+    assert_eq!(
+        two_lock_events,
+        one_lock_events * 2,
+        "each lock_funds call should emit the same number of events"
+    );
+}
+
