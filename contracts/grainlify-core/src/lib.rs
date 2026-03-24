@@ -1579,8 +1579,7 @@ mod test {
     pub mod upgrade_rollback_tests;
 
     // WASM for testing
-    pub const WASM: &[u8] =
-        include_bytes!("../target/wasm32v1-none/release/grainlify_core.wasm");
+    pub const WASM: &[u8] = include_bytes!("../target/wasm32v1-none/release/grainlify_core.wasm");
 
     #[test]
     fn multisig_init_works() {
@@ -2122,5 +2121,4 @@ mod test {
         assert_eq!(state.from_version, v_before);
         assert_eq!(state.to_version, 3);
     }
-
 }
