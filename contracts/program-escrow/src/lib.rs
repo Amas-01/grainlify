@@ -156,6 +156,8 @@ const MAINTENANCE_MODE_CHANGED: Symbol = symbol_short!("MaintSt");
 const PROGRAM_RISK_FLAGS_UPDATED: Symbol = symbol_short!("pr_risk");
 const PROGRAM_REGISTRY: Symbol = symbol_short!("ProgReg");
 const PROGRAM_REGISTERED: Symbol = symbol_short!("ProgRgd");
+const RELEASE_SCHEDULED: Symbol = symbol_short!("RelSched");
+const SCHEDULE_RELEASED: Symbol = symbol_short!("SchRel");
 
 // Storage keys
 const PROGRAM_DATA: Symbol = symbol_short!("ProgData");
@@ -320,6 +322,29 @@ pub struct PayoutEvent {
     pub recipient: Address,
     pub amount: i128,
     pub remaining_balance: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReleaseScheduledEvent {
+    pub version: u32,
+    pub program_id: String,
+    pub schedule_id: u64,
+    pub recipient: Address,
+    pub amount: i128,
+    pub release_timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScheduleReleasedEvent {
+    pub version: u32,
+    pub program_id: String,
+    pub schedule_id: u64,
+    pub recipient: Address,
+    pub amount: i128,
+    pub released_at: u64,
+    pub released_by: Address,
 }
 
 #[contracttype]
@@ -1697,6 +1722,14 @@ impl ProgramEscrowContract {
     }
 
     /// Create a release schedule entry that can be triggered at/after `release_timestamp`.
+    ///
+    /// # Arguments
+    /// * `recipient` - Address of the recipient
+    /// * `amount` - Amount to be released
+    /// * `release_timestamp` - Unix timestamp when the release becomes available
+    ///
+    /// # Returns
+    /// The created ProgramReleaseSchedule
     pub fn create_program_release_schedule(
         env: Env,
         recipient: Address,
@@ -1741,6 +1774,19 @@ impl ProgramEscrowContract {
         env.storage()
             .instance()
             .set(&NEXT_SCHEDULE_ID, &(schedule_id + 1));
+
+        // Emit ReleaseScheduled event
+        env.events().publish(
+            (RELEASE_SCHEDULED,),
+            ReleaseScheduledEvent {
+                version: EVENT_VERSION_V2,
+                program_id: program_data.program_id,
+                schedule_id,
+                recipient,
+                amount,
+                release_timestamp,
+            },
+        );
 
         schedule
     }
@@ -1807,11 +1853,26 @@ impl ProgramEscrowContract {
             });
             release_history.push_back(ProgramReleaseHistory {
                 schedule_id: schedule.schedule_id,
-                recipient: schedule.recipient,
+                recipient: schedule.recipient.clone(),
                 amount: schedule.amount,
                 released_at: now,
                 release_type: ReleaseType::Automatic,
             });
+
+            // Emit ScheduleReleased event
+            env.events().publish(
+                (SCHEDULE_RELEASED,),
+                ScheduleReleasedEvent {
+                    version: EVENT_VERSION_V2,
+                    program_id: program_data.program_id.clone(),
+                    schedule_id: schedule.schedule_id,
+                    recipient: schedule.recipient,
+                    amount: schedule.amount,
+                    released_at: now,
+                    released_by: contract_address.clone(),
+                },
+            );
+
             released_count += 1;
         }
 
