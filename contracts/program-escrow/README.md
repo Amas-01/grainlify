@@ -180,6 +180,36 @@ Emitted when a batch payout is executed.
 (BatchPayout, program_id, recipient_count, total_amount, remaining_balance)
 ```
 
+## Payout Semantics: Single vs Batch
+
+Both `single_payout()` and `batch_payout()` operations mirror identical event and receipt semantics to ensure consistent auditing:
+
+### Shared Behavior
+- **Authorization**: Both require authorization from `authorized_payout_key`
+- **Validation**: Both validate positive amounts, sufficient balance, and contract initialization
+- **Atomicity**: Both atomically update balance and append to payout history
+- **History**: Both append `PayoutRecord` entries with recipient, amount, and timestamp
+- **Events**: Both emit versioned events with program_id and updated remaining_balance
+- **Security**: Both protected by reentrancy guard, circuit breaker, and threshold monitors
+- **Dispute Blocking**: Both operations are blocked when a dispute is open
+
+### Event Differences (by design)
+- **Single Payout**: Emits `Payout` event with specific `recipient` address
+- **Batch Payout**: Emits `BatchPayout` event with `recipient_count` summary
+
+This design allows off-chain systems to:
+1. Audit individual winner payouts via `Payout` event
+2. Verify batch operations via `BatchPayout` event metadata
+3. Reconstruct full payout history from event log
+4. Confirm balance decrements across both paths
+
+### Implementation Coverage
+- History appending: ✓ (both paths maintain `payout_history`)
+- Balance decrement: ✓ (both paths update `remaining_balance`)
+- Event emission: ✓ (both paths emit versioned events)
+- Security validation: ✓ (both paths enforce identical checks)
+- Test coverage: ✓ (comprehensive test suite in `test_payouts_splits.rs`)
+
 ## Usage Flow
 
 1. **Initialize Program**: Call `init_program()` with program ID, authorized key, and token address

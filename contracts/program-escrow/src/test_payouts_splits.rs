@@ -18,7 +18,7 @@ use crate::{
         BeneficiarySplit, SplitConfig, TOTAL_BASIS_POINTS,
         disable_split_config, execute_split_payout, get_split_config, preview_split, set_split_config,
     },
-    DataKey, ProgramData, PROGRAM_DATA,
+    DataKey, ProgramData, PROGRAM_DATA, ProgramEscrowContract, ProgramEscrowContractClient, PayoutRecord,
 };
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -523,4 +523,329 @@ fn test_single_beneficiary_receives_full_amount() {
 
     let tc = token::Client::new(&env, &token);
     assert_eq!(tc.balance(&r1), 500);
+}
+
+// ── Single Payout Tests ────────────────────────────────────────────────────────
+//
+// These tests cover the single_payout path which mirrors the batch_payout semantics
+// with history appending and balance decrement.
+
+#[test]
+fn test_single_payout_success_updates_balance_and_history() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let payout_key = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token = token_contract.address();
+    let token_sac = token::StellarAssetClient::new(&env, &token);
+
+    let contract_id = env.register_contract(None, ProgramEscrowContract);
+    token_sac.mint(&contract_id, &50_000i128);
+
+    let recipient = Address::generate(&env);
+    let program_id = String::from_str(&env, "SinglePayoutTest");
+    let amount = 5_000i128;
+
+    let client = ProgramEscrowContractClient::new(&env, &contract_id);
+
+    env.as_contract(&contract_id, || {
+        let program_data = ProgramData {
+            program_id: program_id.clone(),
+            total_funds: 50_000,
+            remaining_balance: 50_000,
+            authorized_payout_key: payout_key.clone(),
+            payout_history: vec![&env],
+            token_address: token.clone(),
+            initial_liquidity: 0,
+        };
+        env.storage()
+            .instance()
+            .set(&PROGRAM_DATA, &program_data);
+    });
+
+    let result = client.single_payout(&recipient, &amount);
+
+    // Verify balance decremented
+    assert_eq!(result.remaining_balance, 45_000);
+    assert_eq!(result.total_funds, 50_000);
+
+    // Verify history appended
+    assert_eq!(result.payout_history.len(), 1);
+    let record = result.payout_history.get(0).unwrap();
+    assert_eq!(record.recipient, recipient);
+    assert_eq!(record.amount, amount);
+
+    // Verify token transferred
+    let tc = token::Client::new(&env, &token);
+    assert_eq!(tc.balance(&recipient), amount);
+}
+
+#[test]
+fn test_single_payout_multiple_payouts_accumulate_history() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let payout_key = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token = token_contract.address();
+    let token_sac = token::StellarAssetClient::new(&env, &token);
+
+    let contract_id = env.register_contract(None, ProgramEscrowContract);
+    token_sac.mint(&contract_id, &100_000i128);
+
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+    let r3 = Address::generate(&env);
+    let program_id = String::from_str(&env, "MultiPayout");
+
+    let client = crate::ProgramEscrowContractClient::new(&env, &contract_id);
+
+    env.as_contract(&contract_id, || {
+        let program_data = ProgramData {
+            program_id: program_id.clone(),
+            total_funds: 100_000,
+            remaining_balance: 100_000,
+            authorized_payout_key: payout_key.clone(),
+            payout_history: vec![&env],
+            token_address: token.clone(),
+            initial_liquidity: 0,
+        };
+        env.storage()
+            .instance()
+            .set(&PROGRAM_DATA, &program_data);
+    });
+
+    // First payout: 25_000 to r1
+    let result1 = client.single_payout(&r1, &25_000);
+    assert_eq!(result1.remaining_balance, 75_000);
+    assert_eq!(result1.payout_history.len(), 1);
+
+    // Second payout: 30_000 to r2
+    let result2 = client.single_payout(&r2, &30_000);
+    assert_eq!(result2.remaining_balance, 45_000);
+    assert_eq!(result2.payout_history.len(), 2);
+
+    // Third payout: 20_000 to r3
+    let result3 = client.single_payout(&r3, &20_000);
+    assert_eq!(result3.remaining_balance, 25_000);
+    assert_eq!(result3.payout_history.len(), 3);
+
+    let tc = token::Client::new(&env, &token);
+    assert_eq!(tc.balance(&r1), 25_000);
+    assert_eq!(tc.balance(&r2), 30_000);
+    assert_eq!(tc.balance(&r3), 20_000);
+}
+
+#[test]
+fn test_single_payout_drains_full_balance() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let payout_key = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token = token_contract.address();
+    let token_sac = token::StellarAssetClient::new(&env, &token);
+
+    let contract_id = env.register_contract(None, ProgramEscrowContract);
+    token_sac.mint(&contract_id, &10_000i128);
+
+    let recipient = Address::generate(&env);
+    let program_id = String::from_str(&env, "DrainTest");
+
+    let client = ProgramEscrowContractClient::new(&env, &contract_id);
+
+    env.as_contract(&contract_id, || {
+        let program_data = ProgramData {
+            program_id: program_id.clone(),
+            total_funds: 10_000,
+            remaining_balance: 10_000,
+            authorized_payout_key: payout_key.clone(),
+            payout_history: vec![&env],
+            token_address: token.clone(),
+            initial_liquidity: 0,
+        };
+        env.storage()
+            .instance()
+            .set(&PROGRAM_DATA, &program_data);
+    });
+
+    let result = client.single_payout(&recipient, &10_000);
+
+    assert_eq!(result.remaining_balance, 0);
+    assert_eq!(result.payout_history.len(), 1);
+
+    let tc = token::Client::new(&env, &token);
+    assert_eq!(tc.balance(&recipient), 10_000);
+}
+
+#[test]
+#[should_panic(expected = "Amount must be greater than zero")]
+fn test_single_payout_rejects_zero_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let payout_key = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token = token_contract.address();
+
+    let contract_id = env.register_contract(None, ProgramEscrowContract);
+    let recipient = Address::generate(&env);
+    let program_id = String::from_str(&env, "ZeroTest");
+
+    let client = ProgramEscrowContractClient::new(&env, &contract_id);
+
+    env.as_contract(&contract_id, || {
+        let program_data = ProgramData {
+            program_id: program_id.clone(),
+            total_funds: 1_000,
+            remaining_balance: 1_000,
+            authorized_payout_key: payout_key.clone(),
+            payout_history: vec![&env],
+            token_address: token.clone(),
+            initial_liquidity: 0,
+        };
+        env.storage()
+            .instance()
+            .set(&PROGRAM_DATA, &program_data);
+    });
+
+    client.single_payout(&recipient, &0);
+}
+
+#[test]
+#[should_panic(expected = "Insufficient balance")]
+fn test_single_payout_rejects_exceeding_balance() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let payout_key = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token = token_contract.address();
+
+    let contract_id = env.register_contract(None, ProgramEscrowContract);
+    let recipient = Address::generate(&env);
+    let program_id = String::from_str(&env, "InsufficientTest");
+
+    let client = crate::ProgramEscrowContractClient::new(&env, &contract_id);
+
+    env.as_contract(&contract_id, || {
+        let program_data = ProgramData {
+            program_id: program_id.clone(),
+            total_funds: 1_000,
+            remaining_balance: 500,
+            authorized_payout_key: payout_key.clone(),
+            payout_history: vec![&env],
+            token_address: token.clone(),
+            initial_liquidity: 0,
+        };
+        env.storage()
+            .instance()
+            .set(&PROGRAM_DATA, &program_data);
+    });
+
+    client.single_payout(&recipient, &1_000);
+}
+
+#[test]
+fn test_single_payout_records_timestamp() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set(soroban_sdk::testutils::LedgerInfo {
+        timestamp: 12345,
+        protocol_version: 20,
+        sequence_number: 100,
+        network_id: soroban_sdk::testutils::default_network_id(),
+        base_reserve: 5000000,
+        min_temp_entry_expiration: 16,
+        min_persistent_entry_expiration: 4096,
+        max_entry_expiration: 6312000,
+    });
+
+    let payout_key = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token = token_contract.address();
+    let token_sac = token::StellarAssetClient::new(&env, &token);
+
+    let contract_id = env.register_contract(None, ProgramEscrowContract);
+    token_sac.mint(&contract_id, &5_000i128);
+
+    let recipient = Address::generate(&env);
+    let program_id = String::from_str(&env, "TimestampTest");
+
+    let client = ProgramEscrowContractClient::new(&env, &contract_id);
+
+    env.as_contract(&contract_id, || {
+        let program_data = ProgramData {
+            program_id: program_id.clone(),
+            total_funds: 5_000,
+            remaining_balance: 5_000,
+            authorized_payout_key: payout_key.clone(),
+            payout_history: vec![&env],
+            token_address: token.clone(),
+            initial_liquidity: 0,
+        };
+        env.storage()
+            .instance()
+            .set(&PROGRAM_DATA, &program_data);
+    });
+
+    let result = client.single_payout(&recipient, &5_000);
+
+    let record = result.payout_history.get(0).unwrap();
+    assert_eq!(record.timestamp, 12345);
+}
+
+#[test]
+fn test_single_payout_many_iterations() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let payout_key = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token = token_contract.address();
+    let token_sac = token::StellarAssetClient::new(&env, &token);
+
+    let contract_id = env.register_contract(None, ProgramEscrowContract);
+    token_sac.mint(&contract_id, &100_000i128);
+
+    let program_id = String::from_str(&env, "ManyIter");
+    let client = ProgramEscrowContractClient::new(&env, &contract_id);
+
+    env.as_contract(&contract_id, || {
+        let program_data = ProgramData {
+            program_id: program_id.clone(),
+            total_funds: 100_000,
+            remaining_balance: 100_000,
+            authorized_payout_key: payout_key.clone(),
+            payout_history: vec![&env],
+            token_address: token.clone(),
+            initial_liquidity: 0,
+        };
+        env.storage()
+            .instance()
+            .set(&PROGRAM_DATA, &program_data);
+    });
+
+    let mut expected_balance = 100_000i128;
+    for i in 0..10 {
+        let recipient = Address::generate(&env);
+        let amount = 1_000i128;
+
+        let result = client.single_payout(&recipient, &amount);
+        expected_balance -= amount;
+
+        assert_eq!(result.remaining_balance, expected_balance);
+        assert_eq!(result.payout_history.len(), i + 1);
+
+        let tc = token::Client::new(&env, &token);
+        assert_eq!(tc.balance(&recipient), amount);
+    }
 }
