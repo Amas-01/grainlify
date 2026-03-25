@@ -859,19 +859,38 @@ pub struct RefundRecord {
     pub mode: RefundMode,
 }
 
+/// A single escrow entry to lock within a [`BountyEscrowContract::batch_lock_funds`] call.
+///
+/// All items in a batch are sorted by ascending `bounty_id` before processing to ensure
+/// deterministic execution order. If any item fails validation, the entire batch reverts.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LockFundsItem {
+    /// Unique identifier for the bounty. Must not already exist in persistent storage
+    /// and must not appear more than once within the same batch (`DuplicateBountyId`).
     pub bounty_id: u64,
+    /// Address of the depositor. Tokens are transferred **from** this address.
+    /// `require_auth()` is called once per unique depositor across the batch.
     pub depositor: Address,
+    /// Gross amount (in token base units) to lock into escrow. Must be `> 0`.
+    /// If an `AmountPolicy` is active, the value must fall within `[min_amount, max_amount]`.
     pub amount: i128,
+    /// Unix timestamp (seconds) after which the depositor may claim a refund
+    /// without requiring admin approval. Must be in the future at lock time.
     pub deadline: u64,
 }
 
+/// A single escrow release entry within a [`BountyEscrowContract::batch_release_funds`] call.
+///
+/// All items in a batch are sorted by ascending `bounty_id` before processing to ensure
+/// deterministic execution order. If any item fails validation, the entire batch reverts.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReleaseFundsItem {
+    /// Identifier of the bounty to release. The escrow record must exist (`BountyNotFound`)
+    /// and must be in `Locked` status (`FundsNotLocked`).
     pub bounty_id: u64,
+    /// Address of the contributor who will receive the released tokens.
     pub contributor: Address,
 }
 
@@ -4062,30 +4081,57 @@ impl BountyEscrowContract {
         ))
     }
 
-    /// Batch lock funds for multiple bounties in a single transaction.
-    /// This improves gas efficiency by reducing transaction overhead.
+    /// Batch lock funds for multiple bounties in a single atomic transaction.
+    ///
+    /// Locks between 1 and [`MAX_BATCH_SIZE`] bounties in one call, reducing
+    /// per-transaction overhead compared to repeated single-item `lock_funds`
+    /// calls.
+    ///
+    /// ## Batch failure semantics
+    ///
+    /// This operation is **strictly atomic** (all-or-nothing):
+    ///
+    /// 1. All items are validated in a single pass **before** any state is
+    ///    mutated or any token transfer is initiated.
+    /// 2. If *any* item fails validation the entire call reverts immediately.
+    ///    No escrow record is written, no token is transferred, and every
+    ///    "sibling" row in the same batch is left completely unaffected.
+    /// 3. After a failed batch the contract is in exactly the same state as
+    ///    before the call; subsequent operations behave as if this call never
+    ///    happened.
+    ///
+    /// ## Ordering guarantee
+    ///
+    /// Items are processed in ascending `bounty_id` order regardless of the
+    /// caller-supplied ordering. This ensures deterministic execution and
+    /// eliminates ordering-based front-running attacks.
+    ///
+    /// ## Checks-Effects-Interactions (CEI)
+    ///
+    /// All escrow records and index updates are written in a first pass
+    /// (Effects); external token transfers and event emissions happen in a
+    /// second pass (Interactions). This ordering prevents reentrancy attacks.
     ///
     /// # Arguments
-    /// * `items` - Vector of LockFundsItem containing bounty_id, depositor, amount, and deadline
+    /// * `items` - 1–[`MAX_BATCH_SIZE`] [`LockFundsItem`] entries (bounty_id,
+    ///   depositor, amount, deadline).
     ///
     /// # Returns
-    /// Number of successfully locked bounties
+    /// Number of bounties successfully locked (equals `items.len()` on success).
     ///
     /// # Errors
-    /// * InvalidBatchSize - if batch size exceeds MAX_BATCH_SIZE or is zero
-    /// * BountyExists - if any bounty_id already exists
-    /// * NotInitialized - if contract is not initialized
+    /// * [`Error::InvalidBatchSize`] — batch is empty or exceeds `MAX_BATCH_SIZE`
+    /// * [`Error::ContractDeprecated`] — contract has been killed via `set_deprecated`
+    /// * [`Error::FundsPaused`] — lock operations are currently paused
+    /// * [`Error::NotInitialized`] — `init` has not been called
+    /// * [`Error::BountyExists`] — a `bounty_id` already exists in storage
+    /// * [`Error::DuplicateBountyId`] — the same `bounty_id` appears more than once
+    /// * [`Error::InvalidAmount`] — any item has `amount ≤ 0`
+    /// * [`Error::ParticipantBlocked`] / [`Error::ParticipantNotAllowed`] — participant filter
     ///
-    /// # Ordering Guarantee
-    /// Items are processed in ascending `bounty_id` order, regardless of caller
-    /// input ordering.
-    ///
-    /// # Note
-    /// This operation is atomic - if any item fails, the entire transaction
-    /// reverts.
     /// # Reentrancy
-    /// Protected by the shared reentrancy guard. All escrow records are
-    /// written first; token transfers happen in a second pass (CEI).
+    /// Protected by the shared reentrancy guard (acquired before validation,
+    /// released after all effects and interactions complete).
     pub fn batch_lock_funds(env: Env, items: Vec<LockFundsItem>) -> Result<u32, Error> {
         if Self::check_paused(&env, symbol_short!("lock")) {
             return Err(Error::FundsPaused);
@@ -4237,37 +4283,73 @@ impl BountyEscrowContract {
             Ok(locked_count)
         })();
 
+        emit_batch_funds_locked(
+            &env,
+            BatchFundsLocked {
+                count: locked_count,
+                total_amount: ordered_items
+                    .iter()
+                    .try_fold(0i128, |acc, i| acc.checked_add(i.amount))
+                    .unwrap(),
+                timestamp,
+            },
+        );
+
         // GUARD: release reentrancy lock
         reentrancy_guard::release(&env);
+        Ok(locked_count)
         result
     }
 
-    /// Batch release funds to multiple contributors in a single transaction.
-    /// This improves gas efficiency by reducing transaction overhead.
+    /// Batch release funds to multiple contributors in a single atomic transaction.
+    ///
+    /// Releases between 1 and [`MAX_BATCH_SIZE`] bounties in one admin-authorised
+    /// call, reducing per-transaction overhead compared to repeated single-item
+    /// `release_funds` calls.
+    ///
+    /// ## Batch failure semantics
+    ///
+    /// This operation is **strictly atomic** (all-or-nothing):
+    ///
+    /// 1. All items are validated in a single pass **before** any escrow status
+    ///    is updated or any token transfer is initiated.
+    /// 2. If *any* item fails validation the entire call reverts immediately.
+    ///    No status is changed, no token leaves the contract, and every
+    ///    "sibling" row in the same batch is left completely unaffected.
+    /// 3. After a failed batch the contract is in exactly the same state as
+    ///    before the call; subsequent operations behave as if this call never
+    ///    happened.
+    ///
+    /// ## Ordering guarantee
+    ///
+    /// Items are processed in ascending `bounty_id` order regardless of the
+    /// caller-supplied ordering, ensuring deterministic execution.
+    ///
+    /// ## Checks-Effects-Interactions (CEI)
+    ///
+    /// All escrow statuses are updated to `Released` in a first pass (Effects);
+    /// external token transfers and event emissions happen in a second pass
+    /// (Interactions).
     ///
     /// # Arguments
-    /// * `items` - Vector of ReleaseFundsItem containing bounty_id and contributor address
+    /// * `items` - 1–[`MAX_BATCH_SIZE`] [`ReleaseFundsItem`] entries (bounty_id,
+    ///   contributor address).
     ///
     /// # Returns
-    /// Number of successfully released bounties
+    /// Number of bounties successfully released (equals `items.len()` on success).
     ///
     /// # Errors
-    /// * InvalidBatchSize - if batch size exceeds MAX_BATCH_SIZE or is zero
-    /// * BountyNotFound - if any bounty_id doesn't exist
-    /// * FundsNotLocked - if any bounty is not in Locked status
-    /// * Unauthorized - if caller is not admin
+    /// * [`Error::InvalidBatchSize`] — batch is empty or exceeds `MAX_BATCH_SIZE`
+    /// * [`Error::FundsPaused`] — release operations are currently paused
+    /// * [`Error::NotInitialized`] — `init` has not been called
+    /// * [`Error::Unauthorized`] — caller is not the admin
+    /// * [`Error::BountyNotFound`] — a `bounty_id` does not exist in storage
+    /// * [`Error::FundsNotLocked`] — a bounty's status is not `Locked`
+    /// * [`Error::DuplicateBountyId`] — the same `bounty_id` appears more than once
     ///
-    /// # Ordering Guarantee
-    /// Items are processed in ascending `bounty_id` order, regardless of caller
-    /// input ordering.
-    ///
-    /// # Note
-    /// This operation is atomic - if any item fails, the entire transaction
-    /// reverts.
     /// # Reentrancy
-    /// Protected by the shared reentrancy guard. All escrow records are
-    /// updated to `Released` first; token transfers happen in a second
-    /// pass (CEI).
+    /// Protected by the shared reentrancy guard (acquired before validation,
+    /// released after all effects and interactions complete).
     pub fn batch_release_funds(env: Env, items: Vec<ReleaseFundsItem>) -> Result<u32, Error> {
         if Self::check_paused(&env, symbol_short!("release")) {
             return Err(Error::FundsPaused);
@@ -5445,3 +5527,7 @@ mod test_serialization_compatibility;
 mod test_status_transitions;
 #[cfg(test)]
 mod test_upgrade_scenarios;
+#[cfg(test)]
+mod test_batch_failure_mode;
+#[cfg(test)]
+mod test_batch_failure_modes;
