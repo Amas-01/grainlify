@@ -174,7 +174,6 @@ pub(crate) fn validate_config(config: &GovernanceConfig) -> Result<(), Error> {
 #[contract]
 pub struct GovernanceContract;
 
-#[contractimpl]
 impl GovernanceContract {
     /// Initializes governance state for the standalone governance contract.
     pub fn init_governance(

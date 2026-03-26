@@ -139,7 +139,6 @@
 //! 5. **Balance Checks**: Verify remaining balance matches expectations
 //! 6. **Token Approval**: Ensure contract has token allowance before locking funds
 
-#![no_std]
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, vec, Address, Env,
     String, Symbol, Vec,
@@ -257,7 +256,7 @@ mod monitoring {
     }
 
     // Track operation
-    pub fn track_operation(env: &Env, operation: Symbol, caller: Address, success: bool) {
+    pub fn track_operation(env: &Env, _operation: Symbol, _caller: Address, success: bool) {
         let key = Symbol::new(env, OPERATION_COUNT);
         let count: u64 = env.storage().persistent().get(&key).unwrap_or(0);
         env.storage().persistent().set(&key, &(count + 1));
@@ -460,7 +459,7 @@ pub enum DataKey {
     ReleaseHistory(String),          // program_id -> Vec<ProgramReleaseHistory>
     NextScheduleId(String),          // program_id -> next schedule_id
     MultisigConfig(String),          // program_id -> MultisigConfig
-    SplitConfig(String),             // program_id -> SplitConfig
+    SplitConfig(String),             // program_id -> SplitConfig (payout splits)
     PayoutApproval(String, Address), // program_id, recipient -> PayoutApproval
     PendingClaim(String, u64),       // (program_id, schedule_id) -> ClaimRecord
     ClaimWindow,                     // u64 seconds (global config)
@@ -469,9 +468,7 @@ pub enum DataKey {
     MaintenanceMode,                 // bool flag
     ProgramDependencies(String),     // program_id -> Vec<String>
     DependencyStatus(String),        // program_id -> DependencyStatus
-    SplitConfig(String),             // program_id -> SplitConfig (payout splits)
     Dispute,                         // DisputeRecord (single active dispute per contract)
-    SplitConfig(String),             // program_id -> SplitConfig
 }
 
 #[contracttype]
@@ -707,7 +704,7 @@ mod anti_abuse {
 mod claim_period;
 pub use claim_period::{ClaimRecord, ClaimStatus};
 mod payout_splits;
-pub use payout_splits::{BeneficiarySplit, SplitConfig};
+pub use payout_splits::{BeneficiarySplit, SplitConfig, SplitPayoutResult};
 #[cfg(test)]
 mod test_claim_period_expiry_cancellation;
 
@@ -722,14 +719,12 @@ mod test_circuit_breaker_audit;
 #[cfg(test)]
 mod error_recovery_tests;
 
-mod payout_splits;
 #[cfg(any())]
 mod reentrancy_tests;
 #[cfg(test)]
 mod test_dispute_resolution;
 mod threshold_monitor;
 mod token_math;
-pub use payout_splits::{BeneficiarySplit, SplitConfig, SplitPayoutResult};
 
 #[cfg(test)]
 mod reentrancy_guard_standalone_test;
@@ -926,7 +921,7 @@ impl ProgramEscrowContract {
         // Apply rate limiting
         anti_abuse::check_rate_limit(&env, authorized_payout_key.clone());
 
-        let start = env.ledger().timestamp();
+        let _start = env.ledger().timestamp();
         let caller = authorized_payout_key.clone();
 
         // Validate program_id (basic length check)
@@ -1207,7 +1202,7 @@ impl ProgramEscrowContract {
 
         // Get fee configuration
         let fee_config = Self::get_fee_config_internal(&env);
-        
+
         // Calculate fees if enabled
         let (fee_amount, net_amount) = if fee_config.fee_enabled && fee_config.lock_fee_rate > 0 {
             let (fee, net) = token_math::split_amount(amount, fee_config.lock_fee_rate);
@@ -1228,7 +1223,7 @@ impl ProgramEscrowContract {
             .total_funds
             .checked_add(amount)
             .unwrap_or_else(|| panic!("Total funds overflow"));
-        
+
         program_data.remaining_balance = program_data
             .remaining_balance
             .checked_add(net_amount)
@@ -2746,44 +2741,6 @@ impl ProgramEscrowContract {
         claim_period::get_claim_window(&env)
     }
 
-    // ========================================================================
-    // Payout Splits
-    // ========================================================================
-
-    pub fn set_split_config(
-        env: Env,
-        program_id: String,
-        beneficiaries: soroban_sdk::Vec<BeneficiarySplit>,
-    ) -> SplitConfig {
-        payout_splits::set_split_config(&env, &program_id, beneficiaries)
-    }
-
-    pub fn get_split_config(env: Env, program_id: String) -> Option<SplitConfig> {
-        payout_splits::get_split_config(&env, &program_id)
-    }
-
-    pub fn disable_split_config(env: Env, program_id: String) {
-        payout_splits::disable_split_config(&env, &program_id)
-    }
-
-    pub fn execute_split_payout(
-        env: Env,
-        program_id: String,
-        total_amount: i128,
-    ) -> SplitPayoutResult {
-        payout_splits::execute_split_payout(&env, &program_id, total_amount)
-    }
-
-    pub fn preview_split(
-        env: Env,
-        program_id: String,
-        total_amount: i128,
-    ) -> soroban_sdk::Vec<BeneficiarySplit> {
-        payout_splits::preview_split(&env, &program_id, total_amount)
-    }
-
-    // ========================================================================
-    // Dispute Resolution
     // ========================================================================
     // Dispute Resolution
     // ========================================================================
