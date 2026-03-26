@@ -531,6 +531,40 @@ pub struct Analytics {
     pub operation_count: u32,
 }
 
+/// Program reputation metrics tracking performance and reliability.
+/// Includes counts of payouts and schedules, funds tracking, and performance scores in basis points.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProgramReputation {
+    /// Total number of direct payouts executed
+    pub total_payouts: u32,
+    /// Total number of release schedules created
+    pub total_scheduled: u32,
+    /// Number of schedules successfully released
+    pub completed_releases: u32,
+    /// Number of schedules awaiting release
+    pub pending_releases: u32,
+    /// Number of schedules past their release timestamp (not yet released)
+    pub overdue_releases: u32,
+    /// Count of disputes (reserved for future use)
+    pub dispute_count: u32,
+    /// Count of refunds (reserved for future use)
+    pub refund_count: u32,
+    /// Total funds locked in escrow
+    pub total_funds_locked: i128,
+    /// Total funds distributed via payouts
+    pub total_funds_distributed: i128,
+    /// Completion rate: (completed_releases / total_scheduled) * 10_000, capped at 10_000
+    /// Defaults to 10_000 if no schedules exist
+    pub completion_rate_bps: u32,
+    /// Payout fulfillment rate: (total_funds_distributed / total_funds_locked) * 10_000
+    /// Defaults to 0 if no funds locked, capped at 10_000
+    pub payout_fulfillment_rate_bps: u32,
+    /// Overall reputation score in basis points (0-10_000)
+    /// Returns 0 if any overdue releases exist (reputation penalty for overdue milestones)
+    pub overall_score_bps: u32,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProgramReleaseSchedule {
