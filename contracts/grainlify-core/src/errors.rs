@@ -62,6 +62,9 @@ pub const ANON_REFUND_REQUIRED: u32 = 222;
 pub const ANON_RESOLVER_NOT_SET: u32 = 223;
 pub const NOT_ANON_VARIANT: u32 = 224;
 pub const USE_INFO_V2_FOR_ANON: u32 = 225;
+pub const INVALID_LABEL: u32 = 226;
+pub const TOO_MANY_LABELS: u32 = 227;
+pub const LABEL_NOT_ALLOWED: u32 = 228;
 
 // 300-399: Identity / KYC Errors
 pub const INVALID_SIGNATURE: u32 = 301;
@@ -76,6 +79,11 @@ pub const INVALID_TIER: u32 = 307;
 pub const PROGRAM_ALREADY_EXISTS: u32 = 401;
 pub const DUPLICATE_PROGRAM_ID: u32 = 402;
 pub const INVALID_BATCH_SIZE_PROGRAM: u32 = 403;
+pub const PROGRAM_NOT_FOUND: u32 = 404;
+pub const SCHEDULE_NOT_FOUND: u32 = 405;
+pub const ALREADY_RELEASED: u32 = 406;
+pub const FUNDS_PAUSED: u32 = 407;
+pub const DUPLICATE_SCHEDULE_ID: u32 = 408;
 
 // 1000+: Circuit Breaker
 pub const CIRCUIT_OPEN: u32 = 1001;
