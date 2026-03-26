@@ -18,20 +18,20 @@ mod reentrancy_guard;
 #[cfg(test)]
 mod test_metadata;
 
+pub mod gas_budget;
 #[cfg(test)]
 mod test_boundary_edge_cases;
 mod test_cross_contract_interface;
 #[cfg(test)]
 mod test_deterministic_randomness;
 #[cfg(test)]
-mod test_multi_token_fees;
-#[cfg(test)]
 mod test_multi_region_treasury;
+#[cfg(test)]
+mod test_multi_token_fees;
 #[cfg(test)]
 mod test_rbac;
 #[cfg(test)]
 mod test_risk_flags;
-pub mod gas_budget;
 mod traits;
 pub mod upgrade_safety;
 
@@ -43,6 +43,8 @@ mod test_maintenance_mode;
 #[cfg(test)]
 mod test_deterministic_error_ordering;
 
+#[cfg(test)]
+mod test_frozen_balance;
 #[cfg(test)]
 mod test_reentrancy_guard;
 
@@ -628,6 +630,10 @@ pub enum Error {
     /// The Soroban host reverts all storage writes and token transfers in the
     /// transaction atomically. Only reachable in test / testutils builds.
     GasBudgetExceeded = 44,
+    /// Returned when an escrow is explicitly frozen by an admin hold.
+    EscrowFrozen = 45,
+    /// Returned when the escrow depositor is explicitly frozen by an admin hold.
+    AddressFrozen = 46,
 }
 
 /// Bit flag: escrow or payout should be treated as elevated risk (indexers, UIs).
@@ -748,6 +754,16 @@ pub struct EscrowInfo {
     pub refund_history: Vec<RefundRecord>,
 }
 
+/// Immutable audit record for an escrow-level or address-level freeze.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FreezeRecord {
+    pub frozen: bool,
+    pub reason: Option<soroban_sdk::String>,
+    pub frozen_at: u64,
+    pub frozen_by: Address,
+}
+
 #[contracttype]
 pub enum DataKey {
     Admin,
@@ -758,6 +774,8 @@ pub enum DataKey {
     Metadata(u64),
     EscrowIndex,             // Vec<u64> of all bounty_ids
     DepositorIndex(Address), // Vec<u64> of bounty_ids by depositor
+    EscrowFreeze(u64),       // bounty_id -> FreezeRecord
+    AddressFreeze(Address),  // address -> FreezeRecord
     FeeConfig,               // Fee configuration
     RefundApproval(u64),     // bounty_id -> RefundApproval
     ReentrancyGuard,
@@ -1222,12 +1240,7 @@ impl BountyEscrowContract {
 
     /// Test-only: combined percentage + fixed fee (capped).
     #[cfg(test)]
-    pub fn combined_fee_pub(
-        amount: i128,
-        rate_bps: i128,
-        fixed: i128,
-        fee_enabled: bool,
-    ) -> i128 {
+    pub fn combined_fee_pub(amount: i128, rate_bps: i128, fixed: i128, fee_enabled: bool) -> i128 {
         Self::combined_fee_amount(amount, rate_bps, fixed, fee_enabled)
     }
 
@@ -1347,7 +1360,9 @@ impl BountyEscrowContract {
 
         for (index, destination) in config.treasury_destinations.iter().enumerate() {
             let share = if index + 1 == destination_count {
-                fee_amount.checked_sub(distributed).ok_or(Error::InvalidAmount)?
+                fee_amount
+                    .checked_sub(distributed)
+                    .ok_or(Error::InvalidAmount)?
             } else {
                 fee_amount
                     .checked_mul(destination.weight as i128)
@@ -1355,15 +1370,17 @@ impl BountyEscrowContract {
                     .ok_or(Error::InvalidAmount)?
             };
 
-            distributed = distributed
-                .checked_add(share)
-                .ok_or(Error::InvalidAmount)?;
+            distributed = distributed.checked_add(share).ok_or(Error::InvalidAmount)?;
 
             if share <= 0 {
                 continue;
             }
 
-            client.transfer(&env.current_contract_address(), &destination.address, &share);
+            client.transfer(
+                &env.current_contract_address(),
+                &destination.address,
+                &share,
+            );
             events::emit_fee_collected(
                 env,
                 events::FeeCollected {
@@ -1729,6 +1746,38 @@ impl BountyEscrowContract {
             })
     }
 
+    fn get_escrow_freeze_record_internal(env: &Env, bounty_id: u64) -> Option<FreezeRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::EscrowFreeze(bounty_id))
+    }
+
+    fn get_address_freeze_record_internal(env: &Env, address: &Address) -> Option<FreezeRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AddressFreeze(address.clone()))
+    }
+
+    fn ensure_escrow_not_frozen(env: &Env, bounty_id: u64) -> Result<(), Error> {
+        if Self::get_escrow_freeze_record_internal(env, bounty_id)
+            .map(|record| record.frozen)
+            .unwrap_or(false)
+        {
+            return Err(Error::EscrowFrozen);
+        }
+        Ok(())
+    }
+
+    fn ensure_address_not_frozen(env: &Env, address: &Address) -> Result<(), Error> {
+        if Self::get_address_freeze_record_internal(env, address)
+            .map(|record| record.frozen)
+            .unwrap_or(false)
+        {
+            return Err(Error::AddressFrozen);
+        }
+        Ok(())
+    }
+
     /// Check if an operation is paused
     fn check_paused(env: &Env, operation: Symbol) -> bool {
         let flags = Self::get_pause_flags(env);
@@ -1743,6 +1792,126 @@ impl BountyEscrowContract {
             return flags.refund_paused;
         }
         false
+    }
+
+    /// Freeze a specific escrow so release and refund paths fail before any token transfer.
+    ///
+    /// Read-only queries remain available while the freeze is active.
+    pub fn freeze_escrow(
+        env: Env,
+        bounty_id: u64,
+        reason: Option<soroban_sdk::String>,
+    ) -> Result<(), Error> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::NotInitialized);
+        }
+        if !env.storage().persistent().has(&DataKey::Escrow(bounty_id))
+            && !env
+                .storage()
+                .persistent()
+                .has(&DataKey::EscrowAnon(bounty_id))
+        {
+            return Err(Error::BountyNotFound);
+        }
+
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        let record = FreezeRecord {
+            frozen: true,
+            reason,
+            frozen_at: env.ledger().timestamp(),
+            frozen_by: admin,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::EscrowFreeze(bounty_id), &record);
+        env.events()
+            .publish((symbol_short!("frzesc"), bounty_id), record);
+        Ok(())
+    }
+
+    /// Remove an escrow-level freeze and restore normal release/refund behavior.
+    pub fn unfreeze_escrow(env: Env, bounty_id: u64) -> Result<(), Error> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::NotInitialized);
+        }
+        if !env.storage().persistent().has(&DataKey::Escrow(bounty_id))
+            && !env
+                .storage()
+                .persistent()
+                .has(&DataKey::EscrowAnon(bounty_id))
+        {
+            return Err(Error::BountyNotFound);
+        }
+
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::EscrowFreeze(bounty_id));
+        env.events().publish(
+            (symbol_short!("unfrzes"), bounty_id),
+            (admin, env.ledger().timestamp()),
+        );
+        Ok(())
+    }
+
+    /// Return the current escrow-level freeze record, if one exists.
+    pub fn get_escrow_freeze_record(env: Env, bounty_id: u64) -> Option<FreezeRecord> {
+        Self::get_escrow_freeze_record_internal(&env, bounty_id)
+    }
+
+    /// Freeze all release/refund operations for escrows owned by `address`.
+    ///
+    /// Read-only queries remain available while the freeze is active.
+    pub fn freeze_address(
+        env: Env,
+        address: Address,
+        reason: Option<soroban_sdk::String>,
+    ) -> Result<(), Error> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::NotInitialized);
+        }
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        let record = FreezeRecord {
+            frozen: true,
+            reason,
+            frozen_at: env.ledger().timestamp(),
+            frozen_by: admin,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::AddressFreeze(address.clone()), &record);
+        env.events()
+            .publish((symbol_short!("frzaddr"), address), record);
+        Ok(())
+    }
+
+    /// Remove an address-level freeze and restore normal release/refund behavior.
+    pub fn unfreeze_address(env: Env, address: Address) -> Result<(), Error> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::NotInitialized);
+        }
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::AddressFreeze(address.clone()));
+        env.events().publish(
+            (symbol_short!("unfrzad"), address),
+            (admin, env.ledger().timestamp()),
+        );
+        Ok(())
+    }
+
+    /// Return the current address-level freeze record, if one exists.
+    pub fn get_address_freeze_record(env: Env, address: Address) -> Option<FreezeRecord> {
+        Self::get_address_freeze_record_internal(&env, &address)
     }
 
     /// Check if the contract is in maintenance mode
@@ -2476,16 +2645,18 @@ impl BountyEscrowContract {
         soroban_sdk::log!(&env, "transfer ok");
 
         // Resolve effective fee config (per-token takes precedence over global).
-        let (lock_fee_rate, _release_fee_rate, lock_fixed_fee, _release_fixed, fee_recipient, fee_enabled) =
-            Self::resolve_fee_config(&env);
+        let (
+            lock_fee_rate,
+            _release_fee_rate,
+            lock_fixed_fee,
+            _release_fixed,
+            fee_recipient,
+            fee_enabled,
+        ) = Self::resolve_fee_config(&env);
 
         // Deduct lock fee from the escrowed principal (percentage + fixed, capped at deposit).
-        let fee_amount = Self::combined_fee_amount(
-            amount,
-            lock_fee_rate,
-            lock_fixed_fee,
-            fee_enabled,
-        );
+        let fee_amount =
+            Self::combined_fee_amount(amount, lock_fee_rate, lock_fixed_fee, fee_enabled);
 
         // Net amount stored in escrow after fee.
         // Fee must never exceed the deposit; guard against misconfiguration.
@@ -2601,14 +2772,14 @@ impl BountyEscrowContract {
     /// This function performs only read operations. No storage writes, token transfers,
     /// or events are emitted.
     pub fn archive_escrow(env: Env, bounty_id: u64) -> Result<(), Error> {
-        let admin = Self::require_admin(&env)?;
+        let admin = rbac::require_admin(&env);
         admin.require_auth();
 
         let mut escrow = env
             .storage()
             .persistent()
             .get::<DataKey, Escrow>(&DataKey::Escrow(bounty_id))
-            .ok_or(Error::EscrowNotFound)?;
+            .ok_or(Error::BountyNotFound)?;
 
         escrow.archived = true;
         escrow.archived_at = Some(env.ledger().timestamp());
@@ -2742,8 +2913,14 @@ impl BountyEscrowContract {
             return Err(Error::InsufficientFunds);
         }
         // 8. Fee computation (pure)
-        let (lock_fee_rate, _release_fee_rate, lock_fixed_fee, _release_fixed, _fee_recipient, fee_enabled) =
-            Self::resolve_fee_config(env);
+        let (
+            lock_fee_rate,
+            _release_fee_rate,
+            lock_fixed_fee,
+            _release_fixed,
+            _fee_recipient,
+            fee_enabled,
+        ) = Self::resolve_fee_config(env);
         let fee_amount =
             Self::combined_fee_amount(amount, lock_fee_rate, lock_fixed_fee, fee_enabled);
         let net_amount = amount.checked_sub(fee_amount).unwrap_or(amount);
@@ -2935,14 +3112,23 @@ impl BountyEscrowContract {
             .get(&DataKey::Escrow(bounty_id))
             .unwrap();
 
+        Self::ensure_escrow_not_frozen(&env, bounty_id)?;
+        Self::ensure_address_not_frozen(&env, &escrow.depositor)?;
+
         if escrow.status != EscrowStatus::Locked {
             env.storage().instance().remove(&DataKey::ReentrancyGuard);
             return Err(Error::FundsNotLocked);
         }
 
         // Resolve effective fee config for release.
-        let (_lock_fee_rate, release_fee_rate, _lock_fixed, release_fixed_fee, fee_recipient, fee_enabled) =
-            Self::resolve_fee_config(&env);
+        let (
+            _lock_fee_rate,
+            release_fee_rate,
+            _lock_fixed,
+            release_fixed_fee,
+            fee_recipient,
+            fee_enabled,
+        ) = Self::resolve_fee_config(&env);
 
         let release_fee = Self::combined_fee_amount(
             escrow.amount,
@@ -3058,11 +3244,19 @@ impl BountyEscrowContract {
             .persistent()
             .get(&DataKey::Escrow(bounty_id))
             .unwrap();
+        Self::ensure_escrow_not_frozen(env, bounty_id)?;
+        Self::ensure_address_not_frozen(env, &escrow.depositor)?;
         if escrow.status != EscrowStatus::Locked {
             return Err(Error::FundsNotLocked);
         }
-        let (_lock_fee_rate, release_fee_rate, _lock_fixed, release_fixed_fee, _fee_recipient, fee_enabled) =
-            Self::resolve_fee_config(env);
+        let (
+            _lock_fee_rate,
+            release_fee_rate,
+            _lock_fixed,
+            release_fixed_fee,
+            _fee_recipient,
+            fee_enabled,
+        ) = Self::resolve_fee_config(env);
         let release_fee = Self::combined_fee_amount(
             escrow.amount,
             release_fee_rate,
@@ -3107,6 +3301,8 @@ impl BountyEscrowContract {
             .persistent()
             .get(&DataKey::Escrow(bounty_id))
             .unwrap();
+        Self::ensure_escrow_not_frozen(&env, bounty_id)?;
+        Self::ensure_address_not_frozen(&env, &escrow.depositor)?;
         if escrow.status != EscrowStatus::Locked {
             return Err(Error::FundsNotLocked);
         }
@@ -3204,6 +3400,9 @@ impl BountyEscrowContract {
             .get(&DataKey::Escrow(bounty_id))
             .unwrap();
 
+        Self::ensure_escrow_not_frozen(&env, bounty_id)?;
+        Self::ensure_address_not_frozen(&env, &escrow.depositor)?;
+
         if escrow.status != EscrowStatus::Locked {
             return Err(Error::FundsNotLocked);
         }
@@ -3282,6 +3481,8 @@ impl BountyEscrowContract {
             .persistent()
             .get(&DataKey::Escrow(bounty_id))
             .unwrap();
+        Self::ensure_escrow_not_frozen(&env, bounty_id)?;
+        Self::ensure_address_not_frozen(&env, &escrow.depositor)?;
         escrow.status = EscrowStatus::Released;
         escrow.remaining_amount = 0;
         env.storage()
@@ -3368,6 +3569,8 @@ impl BountyEscrowContract {
             .persistent()
             .get(&DataKey::Escrow(bounty_id))
             .unwrap();
+        Self::ensure_escrow_not_frozen(&env, bounty_id)?;
+        Self::ensure_address_not_frozen(&env, &escrow.depositor)?;
         escrow.status = EscrowStatus::Released;
         escrow.remaining_amount = 0;
         env.storage()
@@ -3550,6 +3753,9 @@ impl BountyEscrowContract {
             .get(&DataKey::Escrow(bounty_id))
             .unwrap();
 
+        Self::ensure_escrow_not_frozen(&env, bounty_id)?;
+        Self::ensure_address_not_frozen(&env, &escrow.depositor)?;
+
         if escrow.status != EscrowStatus::Locked {
             return Err(Error::FundsNotLocked);
         }
@@ -3591,7 +3797,7 @@ impl BountyEscrowContract {
             FundsReleased {
                 version: EVENT_VERSION_V2,
                 bounty_id,
-                amount: net_to_contributor,
+                amount: payout_amount,
                 recipient: contributor,
                 timestamp: env.ledger().timestamp(),
             },
@@ -3635,6 +3841,9 @@ impl BountyEscrowContract {
             .persistent()
             .get(&DataKey::Escrow(bounty_id))
             .unwrap();
+
+        Self::ensure_escrow_not_frozen(&env, bounty_id)?;
+        Self::ensure_address_not_frozen(&env, &escrow.depositor)?;
 
         // Require authenticated approval from both admin and depositor.
         let admin: Address = env
@@ -3813,6 +4022,8 @@ impl BountyEscrowContract {
             .persistent()
             .get(&DataKey::Escrow(bounty_id))
             .unwrap();
+        Self::ensure_escrow_not_frozen(env, bounty_id)?;
+        Self::ensure_address_not_frozen(env, &escrow.depositor)?;
         if escrow.status != EscrowStatus::Locked && escrow.status != EscrowStatus::PartiallyRefunded
         {
             return Err(Error::FundsNotLocked);
@@ -3908,6 +4119,8 @@ impl BountyEscrowContract {
             .persistent()
             .get(&DataKey::EscrowAnon(bounty_id))
             .unwrap();
+
+        Self::ensure_escrow_not_frozen(&env, bounty_id)?;
 
         if anon.status != EscrowStatus::Locked && anon.status != EscrowStatus::PartiallyRefunded {
             return Err(Error::FundsNotLocked);
@@ -4032,6 +4245,9 @@ impl BountyEscrowContract {
             .persistent()
             .get(&DataKey::Escrow(bounty_id))
             .unwrap();
+
+        Self::ensure_escrow_not_frozen(&env, bounty_id)?;
+        Self::ensure_address_not_frozen(&env, &escrow.depositor)?;
 
         if escrow.status != EscrowStatus::Locked && escrow.status != EscrowStatus::PartiallyRefunded
         {
@@ -4894,9 +5110,28 @@ impl BountyEscrowContract {
                 },
             );
 
+            Ok(locked_count)
+        })();
+
+        // Gas budget cap enforcement (test / testutils only).
+        #[cfg(any(test, feature = "testutils"))]
+        if result.is_ok() {
+            let gas_cfg = gas_budget::get_config(&env);
+            if let Err(e) = gas_budget::check(
+                &env,
+                symbol_short!("b_lock"),
+                &gas_cfg.batch_lock,
+                &gas_snapshot,
+                gas_cfg.enforce,
+            ) {
+                reentrancy_guard::release(&env);
+                return Err(e);
+            }
+        }
+
         // GUARD: release reentrancy lock
         reentrancy_guard::release(&env);
-        Ok(locked_count)
+        result
     }
 
     /// Alias for batch_lock_funds to match the requested naming convention.
@@ -5001,6 +5236,9 @@ impl BountyEscrowContract {
                     .persistent()
                     .get(&DataKey::Escrow(item.bounty_id))
                     .unwrap();
+
+                Self::ensure_escrow_not_frozen(&env, item.bounty_id)?;
+                Self::ensure_address_not_frozen(&env, &escrow.depositor)?;
 
                 // Check if funds are locked
                 if escrow.status != EscrowStatus::Locked {
