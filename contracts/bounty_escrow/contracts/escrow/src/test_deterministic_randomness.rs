@@ -20,4 +20,11 @@ use soroban_sdk::{
     token, Address, BytesN, Env, Vec as SdkVec,
 };
 
+#[test]
+fn deterministic_randomness_module_loads() {
+    let env = Env::default();
+    let _admin = Address::generate(&env);
+    let _token_admin = Address::generate(&env);
+    let _seed = BytesN::<32>::from_array(&env, &[7u8; 32]);
+    let _v: SdkVec<u32> = SdkVec::new(&env);
 }

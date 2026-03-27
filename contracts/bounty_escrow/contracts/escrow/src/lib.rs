@@ -1,9 +1,9 @@
-use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
-
 pub mod gas_budget;
+mod events;
 #[cfg(test)]
 mod test_boundary_edge_cases;
+#[cfg(test)]
+mod test_renew_rollover;
 mod test_cross_contract_interface;
 #[cfg(test)]
 mod test_deterministic_randomness;
@@ -18,19 +18,12 @@ mod test_risk_flags;
 mod traits;
 pub mod upgrade_safety;
 
-use crate::constants::*;
-use crate::errors::*;
-use crate::events::*;
-use crate::state::*;
-
-declare_id!("8vS5pL7e6k2xP7L9R9jGv6D5v8S5pL7e6k2xP7L9R9jG");
-
 #[cfg(test)]
 mod test_frozen_balance;
 #[cfg(test)]
 mod test_reentrancy_guard;
 
-use events::{
+use crate::events::{
     emit_batch_funds_locked, emit_batch_funds_released, emit_bounty_initialized,
     emit_deprecation_state_changed, emit_deterministic_selection, emit_funds_locked,
     emit_funds_locked_anon, emit_funds_refunded, emit_funds_released,
@@ -797,6 +790,10 @@ pub enum DataKey {
     /// Per-operation gas budget caps configured by the admin.
     /// See [`gas_budget::GasBudgetConfig`].
     GasBudgetConfig,
+    /// Per-bounty renewal history (`Vec<RenewalRecord>`).
+    RenewalHistory(u64),
+    /// Per-bounty rollover chain link metadata.
+    CycleLink(u64),
 }
 
 #[contracttype]
@@ -994,6 +991,34 @@ pub struct RefundRecord {
     pub recipient: Address,
     pub timestamp: u64,
     pub mode: RefundMode,
+}
+
+/// Immutable record of one successful escrow renewal.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RenewalRecord {
+    /// Monotonic renewal sequence for this bounty (`1..=n`).
+    pub cycle: u32,
+    /// Previous deadline before renewal.
+    pub old_deadline: u64,
+    /// New deadline after renewal.
+    pub new_deadline: u64,
+    /// Additional funds deposited during renewal (`0` when extension-only).
+    pub additional_amount: i128,
+    /// Ledger timestamp when renewal was applied.
+    pub renewed_at: u64,
+}
+
+/// Link metadata connecting bounty cycles in a rollover chain.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CycleLink {
+    /// Previous bounty id in the chain (`0` for chain root).
+    pub previous_id: u64,
+    /// Next bounty id in the chain (`0` when no successor exists).
+    pub next_id: u64,
+    /// Zero-based chain depth for stored links (`0` root, `1` first successor, ...).
+    pub cycle: u32,
 }
 
 /// A single escrow entry to lock within a [`BountyEscrowContract::batch_lock_funds`] call.
@@ -1281,89 +1306,87 @@ impl BountyEscrowContract {
         Ok(())
     }
 
-    /// Routes a collected fee to either the default recipient or configured treasury splits.
-    ///
-    /// Accepts a pre-constructed [`FeeCollected`] event which contains all fee details.
-    /// The token client and fee config are resolved internally from contract storage.
-    fn route_fee(env: &Env, fee_event: events::FeeCollected) {
-        if fee_event.amount <= 0 {
-            return;
+    /// Routes a fee either to the configured fee recipient or across weighted treasury routes.
+    fn route_fee(
+        env: &Env,
+        client: &token::Client,
+        config: &FeeConfig,
+        amount: i128,
+        fee_rate: i128,
+        operation_type: events::FeeOperationType,
+    ) -> Result<(), Error> {
+        if amount <= 0 {
+            return Ok(());
         }
+
         let fee_fixed = match operation_type {
             events::FeeOperationType::Lock => config.lock_fixed_fee,
             events::FeeOperationType::Release => config.release_fixed_fee,
         };
 
-        let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
-        let client = token::Client::new(env, &token_addr);
-        let config = Self::get_fee_config_internal(env);
-
         if !config.distribution_enabled || config.treasury_destinations.is_empty() {
             client.transfer(
                 &env.current_contract_address(),
-                &fee_event.recipient,
-                &fee_event.amount,
+                &config.fee_recipient,
+                &amount,
             );
-            events::emit_fee_collected(env, fee_event);
-            return;
+            events::emit_fee_collected(
+                env,
+                events::FeeCollected {
+                    operation_type,
+                    amount,
+                    fee_rate,
+                    fee_fixed,
+                    recipient: config.fee_recipient.clone(),
+                    timestamp: env.ledger().timestamp(),
+                },
+            );
+            return Ok(());
         }
 
         let mut total_weight: u64 = 0;
         for destination in config.treasury_destinations.iter() {
             total_weight = total_weight
                 .checked_add(destination.weight as u64)
-                .unwrap_or(u64::MAX);
+                .ok_or(Error::InvalidAmount)?;
         }
-
         if total_weight == 0 {
-            client.transfer(
-                &env.current_contract_address(),
-                &fee_event.recipient,
-                &fee_event.amount,
-            );
-            events::emit_fee_collected(env, fee_event);
-            return;
+            return Err(Error::InvalidAmount);
         }
 
         let mut distributed = 0i128;
         let destination_count = config.treasury_destinations.len() as usize;
-        let fee_amount = fee_event.amount;
 
         for (index, destination) in config.treasury_destinations.iter().enumerate() {
             let share = if index + 1 == destination_count {
-                fee_amount
-                    .checked_sub(distributed)
-                    .ok_or(Error::InvalidAmount)?
+                amount.checked_sub(distributed).ok_or(Error::InvalidAmount)?
             } else {
-                fee_amount
+                amount
                     .checked_mul(destination.weight as i128)
-                    .and_then(|value| value.checked_div(total_weight as i128))
-                    .unwrap_or(0)
+                    .and_then(|v| v.checked_div(total_weight as i128))
+                    .ok_or(Error::InvalidAmount)?
             };
 
             distributed = distributed.checked_add(share).ok_or(Error::InvalidAmount)?;
-
             if share <= 0 {
                 continue;
             }
 
-            client.transfer(
-                &env.current_contract_address(),
-                &destination.address,
-                &share,
-            );
+            client.transfer(&env.current_contract_address(), &destination.address, &share);
             events::emit_fee_collected(
                 env,
                 events::FeeCollected {
-                    operation_type: fee_event.operation_type.clone(),
+                    operation_type: operation_type.clone(),
                     amount: share,
-                    fee_rate: fee_event.fee_rate,
-                    fee_fixed: fee_event.fee_fixed,
+                    fee_rate,
+                    fee_fixed,
                     recipient: destination.address,
                     timestamp: env.ledger().timestamp(),
                 },
             );
         }
+
+        Ok(())
     }
 
     /// Update fee configuration (admin only)
@@ -4038,6 +4061,249 @@ impl BountyEscrowContract {
         Ok((refund_amount, resulting_status, remaining_after))
     }
 
+    fn default_cycle_link() -> CycleLink {
+        CycleLink {
+            previous_id: 0,
+            next_id: 0,
+            cycle: 0,
+        }
+    }
+
+    /// Extends the deadline of an active escrow and optionally tops up locked funds.
+    ///
+    /// # Security assumptions
+    /// - Only `Locked` escrows are renewable.
+    /// - Renewal is only allowed before the current deadline elapses.
+    /// - New deadline must strictly increase the current deadline.
+    /// - Top-ups transfer tokens from the original depositor into this contract.
+    pub fn renew_escrow(
+        env: Env,
+        bounty_id: u64,
+        new_deadline: u64,
+        additional_amount: i128,
+    ) -> Result<(), Error> {
+        if !env.storage().persistent().has(&DataKey::Escrow(bounty_id)) {
+            return Err(Error::BountyNotFound);
+        }
+
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(bounty_id))
+            .unwrap();
+
+        Self::ensure_escrow_not_frozen(&env, bounty_id)?;
+        Self::ensure_address_not_frozen(&env, &escrow.depositor)?;
+
+        if escrow.status != EscrowStatus::Locked {
+            return Err(Error::FundsNotLocked);
+        }
+
+        let now = env.ledger().timestamp();
+        if now >= escrow.deadline {
+            return Err(Error::DeadlineNotPassed);
+        }
+        if new_deadline <= escrow.deadline {
+            return Err(Error::InvalidDeadline);
+        }
+        if additional_amount < 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        // The original depositor must authorize every renewal and any top-up transfer.
+        escrow.depositor.require_auth();
+
+        if additional_amount > 0 {
+            let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+            let client = token::Client::new(&env, &token_addr);
+            client.transfer(
+                &escrow.depositor,
+                &env.current_contract_address(),
+                &additional_amount,
+            );
+
+            escrow.amount = escrow
+                .amount
+                .checked_add(additional_amount)
+                .ok_or(Error::InvalidAmount)?;
+            escrow.remaining_amount = escrow
+                .remaining_amount
+                .checked_add(additional_amount)
+                .ok_or(Error::InvalidAmount)?;
+        }
+
+        let old_deadline = escrow.deadline;
+        escrow.deadline = new_deadline;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(bounty_id), &escrow);
+
+        let mut history: Vec<RenewalRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RenewalHistory(bounty_id))
+            .unwrap_or(Vec::new(&env));
+        let cycle = history.len().saturating_add(1);
+        history.push_back(RenewalRecord {
+            cycle,
+            old_deadline,
+            new_deadline,
+            additional_amount,
+            renewed_at: now,
+        });
+        env.storage()
+            .persistent()
+            .set(&DataKey::RenewalHistory(bounty_id), &history);
+
+        Ok(())
+    }
+
+    /// Starts a new bounty cycle from a completed prior cycle without mutating prior records.
+    ///
+    /// # Security assumptions
+    /// - Previous cycle must be finalized (`Released` or `Refunded`).
+    /// - A cycle can have at most one direct successor.
+    /// - New cycle funds are transferred from the original depositor.
+    pub fn create_next_cycle(
+        env: Env,
+        previous_bounty_id: u64,
+        new_bounty_id: u64,
+        amount: i128,
+        deadline: u64,
+    ) -> Result<(), Error> {
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        if deadline <= env.ledger().timestamp() {
+            return Err(Error::InvalidDeadline);
+        }
+        if previous_bounty_id == new_bounty_id {
+            return Err(Error::BountyExists);
+        }
+        if env.storage().persistent().has(&DataKey::Escrow(new_bounty_id)) {
+            return Err(Error::BountyExists);
+        }
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::Escrow(previous_bounty_id))
+        {
+            return Err(Error::BountyNotFound);
+        }
+
+        let previous: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(previous_bounty_id))
+            .unwrap();
+        if previous.status != EscrowStatus::Released && previous.status != EscrowStatus::Refunded {
+            return Err(Error::FundsNotLocked);
+        }
+
+        let mut prev_link: CycleLink = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CycleLink(previous_bounty_id))
+            .unwrap_or(Self::default_cycle_link());
+        if prev_link.next_id != 0 {
+            return Err(Error::BountyExists);
+        }
+
+        previous.depositor.require_auth();
+        let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        let client = token::Client::new(&env, &token_addr);
+        client.transfer(&previous.depositor, &env.current_contract_address(), &amount);
+
+        let new_escrow = Escrow {
+            depositor: previous.depositor.clone(),
+            amount,
+            remaining_amount: amount,
+            status: EscrowStatus::Locked,
+            deadline,
+            refund_history: Vec::new(&env),
+            archived: false,
+            archived_at: None,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(new_bounty_id), &new_escrow);
+
+        let mut index: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EscrowIndex)
+            .unwrap_or(Vec::new(&env));
+        index.push_back(new_bounty_id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::EscrowIndex, &index);
+
+        let mut depositor_index: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DepositorIndex(previous.depositor.clone()))
+            .unwrap_or(Vec::new(&env));
+        depositor_index.push_back(new_bounty_id);
+        env.storage().persistent().set(
+            &DataKey::DepositorIndex(previous.depositor.clone()),
+            &depositor_index,
+        );
+
+        prev_link.next_id = new_bounty_id;
+        env.storage()
+            .persistent()
+            .set(&DataKey::CycleLink(previous_bounty_id), &prev_link);
+
+        let new_link = CycleLink {
+            previous_id: previous_bounty_id,
+            next_id: 0,
+            cycle: prev_link.cycle.saturating_add(1),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::CycleLink(new_bounty_id), &new_link);
+
+        Ok(())
+    }
+
+    /// Returns the immutable renewal history for `bounty_id`.
+    pub fn get_renewal_history(env: Env, bounty_id: u64) -> Result<Vec<RenewalRecord>, Error> {
+        if !env.storage().persistent().has(&DataKey::Escrow(bounty_id)) {
+            return Err(Error::BountyNotFound);
+        }
+
+        Ok(env
+            .storage()
+            .persistent()
+            .get(&DataKey::RenewalHistory(bounty_id))
+            .unwrap_or(Vec::new(&env)))
+    }
+
+    /// Returns the rollover link metadata for `bounty_id`.
+    ///
+    /// Returns a default root link with `cycle=1` when no explicit cycle record exists yet.
+    pub fn get_cycle_info(env: Env, bounty_id: u64) -> Result<CycleLink, Error> {
+        if !env.storage().persistent().has(&DataKey::Escrow(bounty_id)) {
+            return Err(Error::BountyNotFound);
+        }
+
+        let link: CycleLink = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CycleLink(bounty_id))
+            .unwrap_or(Self::default_cycle_link());
+
+        if link.previous_id == 0 && link.next_id == 0 && link.cycle == 0 {
+            return Ok(CycleLink {
+                previous_id: 0,
+                next_id: 0,
+                cycle: 1,
+            });
+        }
+
+        Ok(link)
+    }
+
     /// Sets or clears the anonymous resolver address.
     /// Only the admin can call this. The resolver is the trusted entity that
     /// resolves anonymous escrow refunds via `refund_resolved`.
@@ -4253,110 +4519,42 @@ impl BountyEscrowContract {
         // EFFECTS: update state before external call (CEI)
         let now = env.ledger().timestamp();
         let refund_to = escrow.depositor.clone();
-
-    pub fn initialize_escrow(
-        ctx: Context<InitializeEscrow>,
-        bounty_id: String,
-        amount: u64,
-        expiry: i64,
-    ) -> Result<()> {
-        let escrow = &mut ctx.accounts.escrow;
-        escrow.initializer = ctx.accounts.initializer.key();
-        escrow.bounty_id = bounty_id;
-        escrow.amount = amount;
-        escrow.expiry = expiry;
-        escrow.status = EscrowStatus::Active;
-        escrow.bump = ctx.bumps.escrow;
-
-        // Transfer tokens to vault
-        let cpi_accounts = Transfer {
-            from: ctx.accounts.initializer_token_account.to_account_info(),
-            to: ctx.accounts.vault_token_account.to_account_info(),
-            authority: ctx.accounts.initializer.to_account_info(),
-        };
-        let cpi_program = ctx.accounts.token_program.to_account_info();
-        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
-        token::transfer(cpi_ctx, amount)?;
-
-        emit!(EscrowInitialized {
-            bounty_id: escrow.bounty_id.clone(),
-            initializer: escrow.initializer,
-            amount,
-        });
-
-        Ok(())
-    }
-
-    pub fn complete_bounty(ctx: Context<CompleteBounty>) -> Result<()> {
-        let escrow = &mut ctx.accounts.escrow;
-        require!(escrow.status == EscrowStatus::Active, EscrowError::EscrowNotActive);
-
-        let seeds = &[
-            b"escrow".as_ref(),
-            escrow.initializer.as_ref(),
-            escrow.bounty_id.as_bytes(),
-            &[escrow.bump],
-        ];
-        let signer = &[&seeds[..]];
-
-        let cpi_accounts = Transfer {
-            from: ctx.accounts.vault_token_account.to_account_info(),
-            to: ctx.accounts.contributor_token_account.to_account_info(),
-            authority: escrow.to_account_info(),
-        };
-        let cpi_program = ctx.accounts.token_program.to_account_info();
-        let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer);
-        token::transfer(cpi_ctx, escrow.amount)?;
-
-        escrow.status = EscrowStatus::Completed;
-
-        emit!(BountyCompleted {
-            bounty_id: escrow.bounty_id.clone(),
-            contributor: ctx.accounts.contributor.key(),
-        });
-
-        Ok(())
-    }
-
-    // --- NEW FUNCTIONS FROM new_functions.rs ---
-
-    pub fn set_conditional_refund(
-        ctx: Context<SetRefund>, 
-        mode: RefundMode, 
-        config: GasBudgetConfig
-    ) -> Result<()> {
-        let escrow = &mut ctx.accounts.escrow;
-        let refund_record = &mut ctx.accounts.refund_record;
-
-        refund_record.escrow = escrow.key();
-        refund_record.mode = mode;
-        refund_record.gas_budget = config.max_gas;
-        refund_record.is_resolved = false;
-
-        emit!(RefundModeSet {
-            bounty_id: escrow.bounty_id.clone(),
-            mode,
-        });
-
-        Ok(())
-    }
-
-    pub fn trigger_refund(ctx: Context<TriggerRefund>) -> Result<()> {
-        let escrow = &ctx.accounts.escrow;
-        let refund_record = &mut ctx.accounts.refund_record;
-
-        require!(!refund_record.is_resolved, EscrowError::RefundAlreadyResolved);
-        
-        let clock = Clock::get()?;
-        if refund_record.mode == RefundMode::TimeBased {
-            require!(clock.unix_timestamp > escrow.expiry, EscrowError::ExpiryNotReached);
+        escrow.remaining_amount = escrow.remaining_amount.checked_sub(amount).unwrap();
+        if escrow.remaining_amount == 0 {
+            escrow.status = EscrowStatus::Refunded;
+        } else {
+            escrow.status = EscrowStatus::PartiallyRefunded;
         }
-
-        emit!(RefundTriggered {
-            bounty_id: escrow.bounty_id.clone(),
-            timestamp: clock.unix_timestamp,
+        escrow.refund_history.push_back(RefundRecord {
+            amount,
+            recipient: refund_to.clone(),
+            timestamp: now,
+            mode: if escrow.remaining_amount == 0 {
+                RefundMode::Full
+            } else {
+                RefundMode::Partial
+            },
         });
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(bounty_id), &escrow);
 
+        let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        let client = token::Client::new(&env, &token_addr);
+        client.transfer(&env.current_contract_address(), &refund_to, &amount);
+
+        emit_funds_refunded(
+            &env,
+            FundsRefunded {
+                version: EVENT_VERSION_V2,
+                bounty_id,
+                amount,
+                refund_to,
+                timestamp: now,
+            },
+        );
+
+        reentrancy_guard::release(&env);
         Ok(())
     }
 
@@ -4589,25 +4787,6 @@ impl BountyEscrowContract {
             }
         }
 
-            Ok(locked_count)
-        })();
-
-        // Gas budget cap enforcement (test / testutils only).
-        #[cfg(any(test, feature = "testutils"))]
-        if result.is_ok() {
-            let gas_cfg = gas_budget::get_config(&env);
-            if let Err(e) = gas_budget::check(
-                &env,
-                symbol_short!("b_lock"),
-                &gas_cfg.batch_lock,
-                &gas_snapshot,
-                gas_cfg.enforce,
-            ) {
-                reentrancy_guard::release(&env);
-                return Err(e);
-            }
-        }
-
         // GUARD: release reentrancy lock
         reentrancy_guard::release(&env);
         result
@@ -4790,172 +4969,26 @@ impl BountyEscrowContract {
                     timestamp,
                 },
             );
+            Ok(released_count)
+        })();
 
-        require!(escrow.status == EscrowStatus::Active, EscrowError::EscrowNotActive);
-        require!(!refund_record.is_resolved, EscrowError::RefundAlreadyResolved);
+        // Gas budget cap enforcement (test / testutils only).
+        #[cfg(any(test, feature = "testutils"))]
+        if result.is_ok() {
+            let gas_cfg = gas_budget::get_config(&env);
+            if let Err(e) = gas_budget::check(
+                &env,
+                symbol_short!("b_rel"),
+                &gas_cfg.batch_release,
+                &gas_snapshot,
+                gas_cfg.enforce,
+            ) {
+                reentrancy_guard::release(&env);
+                return Err(e);
+            }
+        }
 
-        let seeds = &[
-            b"escrow".as_ref(),
-            escrow.initializer.as_ref(),
-            escrow.bounty_id.as_bytes(),
-            &[escrow.bump],
-        ];
-        let signer = &[&seeds[..]];
-
-        let cpi_accounts = Transfer {
-            from: ctx.accounts.vault_token_account.to_account_info(),
-            to: ctx.accounts.initializer_token_account.to_account_info(),
-            authority: escrow.to_account_info(),
-        };
-        let cpi_program = ctx.accounts.token_program.to_account_info();
-        let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer);
-        token::transfer(cpi_ctx, escrow.amount)?;
-
-        escrow.status = EscrowStatus::Refunded;
-        refund_record.is_resolved = true;
-
-        emit!(RefundResolved {
-            bounty_id: escrow.bounty_id.clone(),
-            amount: escrow.amount,
-        });
-
-        Ok(())
+        reentrancy_guard::release(&env);
+        result
     }
-}
-
-// --- ACCOUNT CONTEXTS AND TYPES ---
-
-#[derive(Accounts)]
-pub struct InitializeEscrow<'info> {
-    #[account(mut)]
-    pub initializer: Signer<'info>,
-    pub mint: Account<'info, Mint>,
-    #[account(
-        mut,
-        constraint = initializer_token_account.mint == mint.key(),
-        constraint = initializer_token_account.owner == initializer.key()
-    )]
-    pub initializer_token_account: Account<'info, TokenAccount>,
-    #[account(
-        init,
-        payer = initializer,
-        space = 8 + EscrowAccount::LEN,
-        seeds = [b"escrow", initializer.key().as_ref(), bounty_id.as_bytes()],
-        bump
-    )]
-    pub escrow: Account<'info, EscrowAccount>,
-    #[account(
-        init,
-        payer = initializer,
-        token::mint = mint,
-        token::authority = escrow,
-    )]
-    pub vault_token_account: Account<'info, TokenAccount>,
-    pub system_program: Program<'info, System>,
-    pub token_program: Program<'info, Token>,
-    pub rent: Sysvar<'info, Rent>,
-}
-
-#[derive(Accounts)]
-pub struct CompleteBounty<'info> {
-    #[account(mut)]
-    pub contributor: Signer<'info>,
-    #[account(
-        mut,
-        seeds = [b"escrow", escrow.initializer.as_ref(), escrow.bounty_id.as_bytes()],
-        bump = escrow.bump,
-        has_one = initializer,
-    )]
-    pub escrow: Account<'info, EscrowAccount>,
-    /// CHECK: This is the original initializer of the escrow
-    pub initializer: AccountInfo<'info>,
-    #[account(
-        mut,
-        constraint = vault_token_account.owner == escrow.key()
-    )]
-    pub vault_token_account: Account<'info, TokenAccount>,
-    #[account(mut)]
-    pub contributor_token_account: Account<'info, TokenAccount>,
-    pub token_program: Program<'info, Token>,
-}
-
-#[derive(Accounts)]
-pub struct SetRefund<'info> {
-    #[account(mut)]
-    pub initializer: Signer<'info>,
-    #[account(
-        mut,
-        has_one = initializer,
-        seeds = [b"escrow", initializer.key().as_ref(), escrow.bounty_id.as_bytes()],
-        bump = escrow.bump,
-    )]
-    pub escrow: Account<'info, EscrowAccount>,
-    #[account(
-        init,
-        payer = initializer,
-        space = 8 + RefundRecord::LEN,
-        seeds = [b"refund", escrow.key().as_ref()],
-        bump
-    )]
-    pub refund_record: Account<'info, RefundRecord>,
-    pub system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
-pub struct TriggerRefund<'info> {
-    pub caller: Signer<'info>,
-    pub escrow: Account<'info, EscrowAccount>,
-    #[account(
-        mut,
-        seeds = [b"refund", escrow.key().as_ref()],
-        bump,
-    )]
-    pub refund_record: Account<'info, RefundRecord>,
-}
-
-#[derive(Accounts)]
-pub struct ResolveRefund<'info> {
-    #[account(mut)]
-    pub initializer: Signer<'info>,
-    #[account(
-        mut,
-        has_one = initializer,
-        seeds = [b"escrow", initializer.key().as_ref(), escrow.bounty_id.as_bytes()],
-        bump = escrow.bump,
-    )]
-    pub escrow: Account<'info, EscrowAccount>,
-    #[account(
-        mut,
-        seeds = [b"refund", escrow.key().as_ref()],
-        bump,
-    )]
-    pub refund_record: Account<'info, RefundRecord>,
-    #[account(mut)]
-    pub vault_token_account: Account<'info, TokenAccount>,
-    #[account(mut)]
-    pub initializer_token_account: Account<'info, TokenAccount>,
-    pub token_program: Program<'info, Token>,
-}
-
-#[account]
-pub struct RefundRecord {
-    pub escrow: Pubkey,
-    pub mode: RefundMode,
-    pub gas_budget: u64,
-    pub is_resolved: bool,
-}
-
-impl RefundRecord {
-    pub const LEN: usize = 32 + 1 + 8 + 1;
-}
-
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq)]
-pub enum RefundMode {
-    Oracle,
-    TimeBased,
-}
-
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
-pub struct GasBudgetConfig {
-    pub max_gas: u64,
 }
