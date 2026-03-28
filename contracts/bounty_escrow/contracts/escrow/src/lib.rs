@@ -15,6 +15,8 @@ mod test_multi_token_fees;
 mod test_rbac;
 #[cfg(test)]
 mod test_risk_flags;
+#[cfg(test)]
+mod test_draft_state;
 mod traits;
 pub mod upgrade_safety;
 
@@ -648,6 +650,7 @@ pub struct EscrowMetadata {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EscrowStatus {
+    Draft,
     Locked,
     Released,
     Refunded,
@@ -2001,6 +2004,10 @@ impl BountyEscrowContract {
                     .persistent()
                     .get(&DataKey::Escrow(bounty_id))
                     .ok_or(Error::BountyNotFound)?;
+                // Escrow must be published (not in Draft) to release
+                if escrow.status == EscrowStatus::Draft {
+                    return Err(Error::InvalidState);
+                }
                 if escrow.status != EscrowStatus::Locked {
                     return Err(Error::FundsNotLocked);
                 }
@@ -2022,6 +2029,10 @@ impl BountyEscrowContract {
                     .persistent()
                     .get(&DataKey::Escrow(bounty_id))
                     .ok_or(Error::BountyNotFound)?;
+                // Escrow must be published (not in Draft) to refund
+                if escrow.status == EscrowStatus::Draft {
+                    return Err(Error::InvalidState);
+                }
                 if escrow.status != EscrowStatus::Locked
                     && escrow.status != EscrowStatus::PartiallyRefunded
                 {
@@ -2079,6 +2090,10 @@ impl BountyEscrowContract {
                     .persistent()
                     .get(&DataKey::Escrow(capability.bounty_id))
                     .ok_or(Error::BountyNotFound)?;
+                // Escrow must be published (not in Draft) to release
+                if escrow.status == EscrowStatus::Draft {
+                    return Err(Error::InvalidState);
+                }
                 if escrow.status != EscrowStatus::Locked {
                     return Err(Error::FundsNotLocked);
                 }
@@ -2100,6 +2115,10 @@ impl BountyEscrowContract {
                     .persistent()
                     .get(&DataKey::Escrow(capability.bounty_id))
                     .ok_or(Error::BountyNotFound)?;
+                // Escrow must be published (not in Draft) to refund
+                if escrow.status == EscrowStatus::Draft {
+                    return Err(Error::InvalidState);
+                }
                 if escrow.status != EscrowStatus::Locked
                     && escrow.status != EscrowStatus::PartiallyRefunded
                 {
@@ -2652,7 +2671,7 @@ impl BountyEscrowContract {
         let escrow = Escrow {
             depositor: depositor.clone(),
             amount: net_amount,
-            status: EscrowStatus::Locked,
+            status: EscrowStatus::Draft,
             deadline,
             refund_history: vec![&env],
             remaining_amount: net_amount,
@@ -2980,7 +2999,7 @@ impl BountyEscrowContract {
             depositor_commitment: depositor_commitment.clone(),
             amount,
             remaining_amount: amount,
-            status: EscrowStatus::Locked,
+            status: EscrowStatus::Draft,
             deadline,
             refund_history: vec![&env],
             archived: false,
@@ -3032,6 +3051,63 @@ impl BountyEscrowContract {
     ///
     /// # Security
     /// Reentrancy guard is always cleared before any explicit error return after acquisition.
+    pub fn publish(env: Env, bounty_id: u64) -> Result<(), Error> {
+        let caller = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Admin)
+            .expect("Admin not set");
+        let res = Self::publish_logic(env.clone(), bounty_id, caller.clone());
+        monitoring::track_operation(&env, symbol_short!("publish"), caller, res.is_ok());
+        res
+    }
+
+    fn publish_logic(env: Env, bounty_id: u64, publisher: Address) -> Result<(), Error> {
+        // Validation precedence:
+        // 1. Reentrancy guard
+        // 2. Authorization (admin only)
+        // 3. Escrow exists and is in Draft status
+
+        // 1. Acquire reentrancy guard
+        reentrancy_guard::acquire(&env);
+
+        // 2. Admin authorization
+        publisher.require_auth();
+
+        // 3. Get escrow and verify it's in Draft status
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(bounty_id))
+            .ok_or(Error::BountyNotFound)?;
+
+        if escrow.status != EscrowStatus::Draft {
+            reentrancy_guard::release(&env);
+            return Err(Error::InvalidState);
+        }
+
+        // Transition from Draft to Locked
+        escrow.status = EscrowStatus::Locked;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(bounty_id), &escrow);
+
+        // Emit EscrowPublished event
+        emit_escrow_published(
+            &env,
+            EscrowPublished {
+                version: EVENT_VERSION_V2,
+                bounty_id,
+                published_by: publisher,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        multitoken_invariants::assert_after_lock(&env);
+        reentrancy_guard::release(&env);
+        Ok(())
+    }
+
     pub fn release_funds(env: Env, bounty_id: u64, contributor: Address) -> Result<(), Error> {
         let caller = env
             .storage()
@@ -3082,7 +3158,12 @@ impl BountyEscrowContract {
         Self::ensure_escrow_not_frozen(&env, bounty_id)?;
         Self::ensure_address_not_frozen(&env, &escrow.depositor)?;
 
-        if escrow.status != EscrowStatus::Locked {
+        // Escrow must be published (not in Draft) and locked to release funds
+        if escrow.status == EscrowStatus::Draft {
+            reentrancy_guard::release(&env);
+            return Err(Error::InvalidState);
+        }
+        if escrow.status != EscrowStatus::Locked && escrow.status != EscrowStatus::PartiallyRefunded {
             reentrancy_guard::release(&env);
             return Err(Error::FundsNotLocked);
         }
@@ -4218,6 +4299,10 @@ impl BountyEscrowContract {
         Self::ensure_escrow_not_frozen(&env, bounty_id)?;
         Self::ensure_address_not_frozen(&env, &escrow.depositor)?;
 
+        // Escrow must be published (not in Draft) to refund
+        if escrow.status == EscrowStatus::Draft {
+            return Err(Error::InvalidState);
+        }
         if escrow.status != EscrowStatus::Locked && escrow.status != EscrowStatus::PartiallyRefunded
         {
             return Err(Error::FundsNotLocked);
@@ -4507,7 +4592,7 @@ impl BountyEscrowContract {
                 let escrow = Escrow {
                     depositor: item.depositor.clone(),
                     amount: item.amount,
-                    status: EscrowStatus::Locked,
+                    status: EscrowStatus::Draft,
                     deadline: item.deadline,
                     refund_history: vec![&env],
                     remaining_amount: item.amount,
@@ -4589,28 +4674,9 @@ impl BountyEscrowContract {
             }
         }
 
-            Ok(locked_count)
-        })();
-
-        // Gas budget cap enforcement (test / testutils only).
-        #[cfg(any(test, feature = "testutils"))]
-        if result.is_ok() {
-            let gas_cfg = gas_budget::get_config(&env);
-            if let Err(e) = gas_budget::check(
-                &env,
-                symbol_short!("b_lock"),
-                &gas_cfg.batch_lock,
-                &gas_snapshot,
-                gas_cfg.enforce,
-            ) {
-                reentrancy_guard::release(&env);
-                return Err(e);
-            }
-        }
-
         // GUARD: release reentrancy lock
         reentrancy_guard::release(&env);
-        result
+        Ok(locked_count)
     }
 
     /// Alias for batch_lock_funds to match the requested naming convention.

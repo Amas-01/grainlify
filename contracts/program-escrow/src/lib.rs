@@ -424,6 +424,24 @@ pub struct ProgramMetadata {
     pub custom_fields: Vec<(String, String)>,
 }
 
+/// The lifecycle state of a program escrow.
+///
+/// Transitions:
+/// ```text
+/// Draft ──publish_program()──► Active
+/// ```
+///
+/// Programs are created in `Draft` state to allow preparation and review
+/// before becoming active and allowing fund locks and payouts.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProgramStatus {
+    /// Initial state: program is being prepared, no locks or payouts allowed
+    Draft,
+    /// Active state: program is live, locks and payouts are allowed
+    Active,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProgramData {
@@ -441,6 +459,7 @@ pub struct ProgramData {
     pub reference_hash: Option<soroban_sdk::Bytes>,
     pub archived: bool,
     pub archived_at: Option<u64>,
+    pub status: ProgramStatus,
 }
 
 // ========================================================================
@@ -1031,6 +1050,7 @@ impl ProgramEscrowContract {
             reference_hash,
             archived: false,
             archived_at: None,
+            status: ProgramStatus::Draft,
         };
 
         // Store program data in registry
@@ -1422,15 +1442,22 @@ impl ProgramEscrowContract {
     pub fn lock_program_funds(env: Env, amount: i128) -> ProgramData {
         // Validation precedence (deterministic ordering):
         // 1. Contract initialized
-        // 2. Paused (operational state)
-        // 3. Input validation (amount)
+        // 2. Program must be in Active status (not Draft)
+        // 3. Paused (operational state)
+        // 4. Input validation (amount)
 
         // 1. Contract must be initialized
         if !env.storage().instance().has(&PROGRAM_DATA) {
             panic!("Program not initialized");
         }
 
-        // 2. Operational state: paused
+        // 2. Program must be published (not in Draft)
+        let program_data: ProgramData = env.storage().instance().get(&PROGRAM_DATA).unwrap();
+        if program_data.status == ProgramStatus::Draft {
+            panic!("Program is in Draft status. Publish the program first.");
+        }
+
+        // 3. Operational state: paused
         if Self::check_paused(&env, symbol_short!("lock")) {
             panic!("Funds Paused");
         }
