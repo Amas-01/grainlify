@@ -1000,19 +1000,19 @@ fn test_batch_lock_funds_success() {
             depositor: setup.depositor.clone(),
             amount: 1000,
             deadline,
-            },
+        },
         LockFundsItem {
             bounty_id: 2,
             depositor: setup.depositor.clone(),
             amount: 2000,
             deadline,
-            },
+        },
         LockFundsItem {
             bounty_id: 3,
             depositor: setup.depositor.clone(),
             amount: 3000,
             deadline,
-            },
+        },
     ];
 
     setup.token_admin.mint(&setup.depositor, &10_000);
@@ -1087,7 +1087,7 @@ fn test_batch_lock_funds_single_item() {
             depositor: setup.depositor.clone(),
             amount: 1000,
             deadline,
-            },
+        },
     ];
 
     setup.token_admin.mint(&setup.depositor, &1000);
@@ -1112,7 +1112,7 @@ fn test_batch_lock_funds_exceeds_max_batch_size() {
             depositor: setup.depositor.clone(),
             amount: 100,
             deadline,
-            });
+        });
     }
 
     setup.token_admin.mint(&setup.depositor, &10_000);
@@ -1131,7 +1131,7 @@ fn test_batch_lock_funds_at_max_batch_size() {
             depositor: setup.depositor.clone(),
             amount: 100,
             deadline,
-            });
+        });
     }
 
     setup.token_admin.mint(&setup.depositor, &10_000);
@@ -1156,13 +1156,13 @@ fn test_batch_lock_funds_duplicate_bounty_id() {
             depositor: setup.depositor.clone(),
             amount: 2000,
             deadline,
-            },
+        },
         LockFundsItem {
             bounty_id: 2,
             depositor: setup.depositor.clone(),
             amount: 3000,
             deadline,
-            },
+        },
     ];
 
     setup.escrow.batch_lock_funds(&items);
@@ -1181,13 +1181,13 @@ fn test_batch_lock_funds_duplicate_in_batch() {
             depositor: setup.depositor.clone(),
             amount: 1000,
             deadline,
-            },
+        },
         LockFundsItem {
             bounty_id: 1,
             depositor: setup.depositor.clone(),
             amount: 2000,
             deadline,
-            },
+        },
     ];
 
     setup.escrow.batch_lock_funds(&items);
@@ -1206,19 +1206,19 @@ fn test_batch_lock_funds_triple_duplicate_in_batch() {
             depositor: setup.depositor.clone(),
             amount: 1000,
             deadline,
-            },
+        },
         LockFundsItem {
             bounty_id: 1,
             depositor: setup.depositor.clone(),
             amount: 2000,
             deadline,
-            },
+        },
         LockFundsItem {
             bounty_id: 1,
             depositor: setup.depositor.clone(),
             amount: 3000,
             deadline,
-            },
+        },
     ];
 
     setup.token_admin.mint(&setup.depositor, &10000);
@@ -1238,19 +1238,19 @@ fn test_batch_lock_funds_non_adjacent_duplicates() {
             depositor: setup.depositor.clone(),
             amount: 1000,
             deadline,
-            },
+        },
         LockFundsItem {
             bounty_id: 2,
             depositor: setup.depositor.clone(),
             amount: 2000,
             deadline,
-            },
+        },
         LockFundsItem {
             bounty_id: 1,
             depositor: setup.depositor.clone(),
             amount: 3000,
             deadline,
-            },
+        },
     ];
 
     setup.token_admin.mint(&setup.depositor, &10000);
@@ -1270,7 +1270,7 @@ fn test_batch_lock_funds_zero_amount() {
             depositor: setup.depositor.clone(),
             amount: 0,
             deadline,
-            },
+        },
     ];
 
     setup.escrow.batch_lock_funds(&items);
@@ -1289,7 +1289,7 @@ fn test_batch_lock_funds_negative_amount() {
             depositor: setup.depositor.clone(),
             amount: -100,
             deadline,
-            },
+        },
     ];
 
     setup.escrow.batch_lock_funds(&items);
@@ -1308,13 +1308,13 @@ fn test_batch_lock_funds_mixed_valid_invalid_amounts() {
             depositor: setup.depositor.clone(),
             amount: 1000,
             deadline,
-            },
+        },
         LockFundsItem {
             bounty_id: 2,
             depositor: setup.depositor.clone(),
             amount: 0,
             deadline,
-            },
+        },
     ];
 
     setup.token_admin.mint(&setup.depositor, &2000);
@@ -1338,13 +1338,13 @@ fn test_batch_lock_funds_first_valid_second_exists() {
             depositor: setup.depositor.clone(),
             amount: 1000,
             deadline,
-            },
+        },
         LockFundsItem {
             bounty_id: 2,
             depositor: setup.depositor.clone(),
             amount: 2000,
             deadline,
-            },
+        },
     ];
 
     setup.token_admin.mint(&setup.depositor, &5000);
@@ -1368,13 +1368,13 @@ fn test_batch_operations_atomicity() {
             depositor: setup.depositor.clone(),
             amount: 2000,
             deadline,
-            },
+        },
         LockFundsItem {
             bounty_id: 1,
             depositor: setup.depositor.clone(),
             amount: 3000,
             deadline,
-            },
+        },
     ];
 
     setup.escrow.batch_lock_funds(&items);
@@ -1519,7 +1519,7 @@ fn test_batch_release_funds_exceeds_max_batch_size() {
             depositor: setup.depositor.clone(),
             amount: 100,
             deadline,
-            });
+        });
     }
     setup.token_admin.mint(&setup.depositor, &10_000);
     setup.escrow.batch_lock_funds(&lock_items);
@@ -1714,7 +1714,7 @@ fn test_batch_operations_large_batch() {
             depositor: setup.depositor.clone(),
             amount: (i * 100) as i128,
             deadline,
-            });
+        });
     }
 
     setup.token_admin.mint(&setup.depositor, &10_000);
@@ -1757,19 +1757,19 @@ fn test_batch_operations_multiple_depositors() {
             depositor: setup.depositor.clone(),
             amount: 1000,
             deadline,
-            },
+        },
         LockFundsItem {
             bounty_id: 2,
             depositor: depositor2.clone(),
             amount: 2000,
             deadline,
-            },
+        },
         LockFundsItem {
             bounty_id: 3,
             depositor: setup.depositor.clone(),
             amount: 3000,
             deadline,
-            },
+        },
     ];
 
     let count = setup.escrow.batch_lock_funds(&items);
@@ -1833,4 +1833,52 @@ fn test_batch_release_funds_to_multiple_contributors() {
     assert_eq!(setup.token.balance(&contributor2), 2000);
     assert_eq!(setup.token.balance(&contributor3), 3000);
     assert_eq!(setup.escrow.get_balance(), 0);
+}
+
+#[test]
+fn test_combined_fee_percentage_plus_fixed_capped() {
+    assert_eq!(
+        BountyEscrowContract::combined_fee_pub(10_000, 100, 50, true),
+        150
+    );
+    assert_eq!(
+        BountyEscrowContract::combined_fee_pub(100, 0, 500, true),
+        100
+    );
+    assert_eq!(
+        BountyEscrowContract::combined_fee_pub(10_000, 0, 0, false),
+        0
+    );
+}
+
+#[test]
+fn test_lock_and_release_fixed_fee_collection() {
+    let setup = TestSetup::new();
+    let fee_recipient = Address::generate(&setup.env);
+    setup.escrow.update_fee_config(
+        &None,
+        &None,
+        &Some(10i128),
+        &Some(25i128),
+        &Some(fee_recipient.clone()),
+        &Some(true),
+    );
+    let bounty_id = 901_u64;
+    let deadline = setup.env.ledger().timestamp() + 1_000;
+    let gross = 1_000i128;
+    setup
+        .escrow
+        .lock_funds(&setup.depositor, &bounty_id, &gross, &deadline);
+    let escrow = setup.escrow.get_escrow_info(&bounty_id);
+    let lock_fee = BountyEscrowContract::combined_fee_pub(gross, 0, 10, true);
+    assert_eq!(escrow.amount, gross - lock_fee);
+    assert_eq!(setup.token.balance(&fee_recipient), lock_fee);
+
+    setup.escrow.release_funds(&bounty_id, &setup.contributor);
+    let release_fee = BountyEscrowContract::combined_fee_pub(escrow.amount, 0, 25, true);
+    assert_eq!(
+        setup.token.balance(&setup.contributor),
+        escrow.amount - release_fee
+    );
+    assert_eq!(setup.token.balance(&fee_recipient), lock_fee + release_fee);
 }

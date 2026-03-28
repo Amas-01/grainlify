@@ -6,10 +6,13 @@
 //! fully preserved across a simulated WASM upgrade and that [`upgrade_safety`]
 //! functions behave correctly.
 
-use crate::{upgrade_safety, BountyEscrowContract, BountyEscrowContractClient, EscrowStatus};
+use crate::{
+    upgrade_safety, AnonymousEscrow, BountyEscrowContract, BountyEscrowContractClient, DataKey,
+    EscrowStatus,
+};
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
-    token, Address, Env,
+    token, vec, Address, BytesN, Env,
 };
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -49,7 +52,7 @@ fn test_upgrade_locked_bounty_remains_locked() {
     client.init(&admin, &token);
     token_admin_client.mint(&depositor, &10_000);
 
-    let deadline = env.ledger().timestamp() + 1_000;
+    let deadline = env.ledger().timestamp() + 1000;
     client.lock_funds(&depositor, &1, &5_000, &deadline);
 
     // Simulate upgrade by verifying state persistence (WASM swap keeps storage)
@@ -73,7 +76,7 @@ fn test_upgrade_complete_release_flow() {
     client.init(&admin, &token);
     token_admin_client.mint(&depositor, &10_000);
 
-    let deadline = env.ledger().timestamp() + 1_000;
+    let deadline = env.ledger().timestamp() + 1000;
     client.lock_funds(&depositor, &1, &5_000, &deadline);
 
     let escrow = client.get_escrow_info(&1);
@@ -125,7 +128,7 @@ fn test_upgrade_partial_release_then_complete() {
     client.init(&admin, &token);
     token_admin_client.mint(&depositor, &10_000);
 
-    let deadline = env.ledger().timestamp() + 1_000;
+    let deadline = env.ledger().timestamp() + 1000;
     client.lock_funds(&depositor, &3, &6_000, &deadline);
 
     client.partial_release(&3, &contributor, &2_000);
@@ -155,7 +158,10 @@ fn test_safety_check_passes_after_init() {
     client.init(&admin, &token);
 
     let report = env.as_contract(&contract_id, || upgrade_safety::simulate_upgrade(&env));
-    assert!(report.is_safe, "Safety check should pass after initialization");
+    assert!(
+        report.is_safe,
+        "Safety check should pass after initialization"
+    );
     assert_eq!(report.checks_passed, 10);
     assert_eq!(report.checks_failed, 0);
 }
@@ -191,7 +197,10 @@ fn test_safety_check_with_locked_escrows() {
     client.lock_funds(&depositor, &1, &5_000, &deadline);
 
     let report = env.as_contract(&contract_id, || upgrade_safety::simulate_upgrade(&env));
-    assert!(report.is_safe, "Safety check should pass with locked escrows");
+    assert!(
+        report.is_safe,
+        "Safety check should pass with locked escrows"
+    );
 }
 
 /// `validate_upgrade` returns `Ok` for an initialised contract.
@@ -206,7 +215,10 @@ fn test_upgrade_succeeds_with_valid_state() {
     client.init(&admin, &token);
 
     let result = env.as_contract(&contract_id, || upgrade_safety::validate_upgrade(&env));
-    assert!(result.is_ok(), "validate_upgrade should succeed with valid state");
+    assert!(
+        result.is_ok(),
+        "validate_upgrade should succeed with valid state"
+    );
 }
 
 /// `validate_upgrade` returns `Err` for an uninitialised contract.
@@ -227,8 +239,9 @@ fn test_upgrade_fails_without_init() {
 fn test_get_safety_status() {
     let (env, _client, contract_id) = create_test_env();
 
-    let enabled =
-        env.as_contract(&contract_id, || upgrade_safety::is_safety_checks_enabled(&env));
+    let enabled = env.as_contract(&contract_id, || {
+        upgrade_safety::is_safety_checks_enabled(&env)
+    });
     assert!(enabled, "Safety checks should be enabled by default");
 }
 
@@ -241,7 +254,9 @@ fn test_set_safety_status() {
         upgrade_safety::set_safety_checks_enabled(&env, false)
     });
     assert!(
-        !env.as_contract(&contract_id, || upgrade_safety::is_safety_checks_enabled(&env)),
+        !env.as_contract(&contract_id, || upgrade_safety::is_safety_checks_enabled(
+            &env
+        )),
         "Safety checks should be disabled"
     );
 
@@ -249,7 +264,9 @@ fn test_set_safety_status() {
         upgrade_safety::set_safety_checks_enabled(&env, true)
     });
     assert!(
-        env.as_contract(&contract_id, || upgrade_safety::is_safety_checks_enabled(&env)),
+        env.as_contract(&contract_id, || upgrade_safety::is_safety_checks_enabled(
+            &env
+        )),
         "Safety checks should be re-enabled"
     );
 }
@@ -368,15 +385,87 @@ fn test_safety_module_check_count() {
     env.mock_all_auths();
     let contract_id = env.register_contract(None, BountyEscrowContract);
 
-    assert!(env.as_contract(&contract_id, || upgrade_safety::is_safety_checks_enabled(&env)));
+    assert!(
+        env.as_contract(&contract_id, || upgrade_safety::is_safety_checks_enabled(
+            &env
+        ))
+    );
 
     env.as_contract(&contract_id, || {
         upgrade_safety::set_safety_checks_enabled(&env, false)
     });
-    assert!(!env.as_contract(&contract_id, || upgrade_safety::is_safety_checks_enabled(&env)));
+    assert!(
+        !env.as_contract(&contract_id, || upgrade_safety::is_safety_checks_enabled(
+            &env
+        ))
+    );
 
     env.as_contract(&contract_id, || {
         upgrade_safety::set_safety_checks_enabled(&env, true)
     });
-    assert!(env.as_contract(&contract_id, || upgrade_safety::is_safety_checks_enabled(&env)));
+    assert!(
+        env.as_contract(&contract_id, || upgrade_safety::is_safety_checks_enabled(
+            &env
+        ))
+    );
+}
+
+/// Storage layout check fails when EscrowIndex contains a dangling bounty id.
+#[test]
+fn test_storage_layout_fails_for_dangling_index_entry() {
+    let (env, client, contract_id) = create_test_env();
+    let admin = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let (token, _token_client, _token_admin_client) = create_token_contract(&env, &token_admin);
+    client.init(&admin, &token);
+
+    env.as_contract(&contract_id, || {
+        let ids = vec![&env, 999u64];
+        env.storage().persistent().set(&DataKey::EscrowIndex, &ids);
+    });
+
+    let report = env.as_contract(&contract_id, || upgrade_safety::simulate_upgrade(&env));
+    assert!(!report.is_safe);
+    assert!(report
+        .errors
+        .iter()
+        .any(|e| e.code == upgrade_safety::safety_codes::STORAGE_LAYOUT));
+}
+
+/// Storage layout check fails when a bounty id exists in both legacy and
+/// anonymous storage variants.
+#[test]
+fn test_storage_layout_fails_for_dual_variant_collision() {
+    let (env, client, contract_id) = create_test_env();
+
+    let admin = Address::generate(&env);
+    let depositor = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let (token, _token_client, token_admin_client) = create_token_contract(&env, &token_admin);
+
+    client.init(&admin, &token);
+    token_admin_client.mint(&depositor, &10_000);
+    let deadline = env.ledger().timestamp() + 1_000;
+    client.lock_funds(&depositor, &77, &5_000, &deadline);
+
+    let anon = AnonymousEscrow {
+        depositor_commitment: BytesN::from_array(&env, &[7u8; 32]),
+        amount: 5_000,
+        remaining_amount: 5_000,
+        status: EscrowStatus::Locked,
+        deadline,
+        refund_history: vec![&env],
+    };
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::EscrowAnon(77), &anon);
+    });
+
+    let report = env.as_contract(&contract_id, || upgrade_safety::simulate_upgrade(&env));
+    assert!(!report.is_safe);
+    assert!(report
+        .errors
+        .iter()
+        .any(|e| e.code == upgrade_safety::safety_codes::STORAGE_LAYOUT));
 }
