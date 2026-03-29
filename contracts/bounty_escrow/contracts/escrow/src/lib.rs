@@ -42,15 +42,15 @@ use crate::events::{
     emit_ticket_issued, emit_timelock_configured, AdminActionCancelled, AdminActionExecuted,
     AdminActionProposed, BatchFundsLocked, BatchFundsReleased, BountyEscrowInitialized,
     ClaimCancelled, ClaimCreated, ClaimExecuted, CriticalOperationOutcome, DeprecationStateChanged,
-    DeterministicSelectionDerived, EscrowPublished, FundsLocked, FundsLockedAnon, FundsRefunded, FundsReleased,
-    MaintenanceModeChanged, NotificationPreferencesUpdated, ParticipantFilterModeChanged,
-    RefundTriggerType, RiskFlagsUpdated, TicketClaimed, TicketIssued, TimelockConfigured,
-    EVENT_VERSION_V2,
+    DeterministicSelectionDerived, EscrowPublished, FundsLocked, FundsLockedAnon, FundsRefunded,
+    FundsReleased, MaintenanceModeChanged, NotificationPreferencesUpdated,
+    ParticipantFilterModeChanged, RefundTriggerType, RiskFlagsUpdated, TicketClaimed, TicketIssued,
+    TimelockConfigured, EVENT_VERSION_V2,
 };
 use soroban_sdk::xdr::{FromXdr, ToXdr};
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, vec, Address, Bytes, BytesN,
-    Env, String, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, vec, Address, Bytes,
+    BytesN, Env, String, Symbol, Vec,
 };
 
 // ============================================================================

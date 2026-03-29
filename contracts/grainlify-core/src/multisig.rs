@@ -214,9 +214,7 @@ impl MultiSig {
         let config = Self::get_config(env);
         Self::assert_signer(&config, &signer);
         signer.require_auth();
-        env.storage()
-            .instance()
-            .set(&DataKey::Paused, &true);
+        env.storage().instance().set(&DataKey::Paused, &true);
     }
 
     /// Unpause the contract (requires multisig)
@@ -224,9 +222,7 @@ impl MultiSig {
         let config = Self::get_config(env);
         Self::assert_signer(&config, &signer);
         signer.require_auth();
-        env.storage()
-            .instance()
-            .set(&DataKey::Paused, &false);
+        env.storage().instance().set(&DataKey::Paused, &false);
     }
 
     /// =======================
