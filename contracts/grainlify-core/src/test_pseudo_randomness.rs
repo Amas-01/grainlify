@@ -491,7 +491,7 @@ fn test_audit_trail_completeness() {
     let mut score_material = Bytes::new(&env);
     score_material.append(&selection.seed_hash.clone().to_xdr(&env));
     score_material.append(&winner.to_xdr(&env));
-    let recomputed_score = env.crypto().sha256(&score_material).into();
+    let recomputed_score: BytesN<32> = env.crypto().sha256(&score_material).into();
 
     assert_eq!(
         selection.winner_score, recomputed_score,

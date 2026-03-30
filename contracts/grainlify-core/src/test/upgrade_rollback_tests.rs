@@ -132,7 +132,7 @@ fn test_execute_upgrade_with_sufficient_approvals() {
     // Initialize with multisig (2 of 3)
     client.init(&signers, &2);
 
-    let wasm_hash = upload_wasm(&env);
+    let wasm_hash = fake_wasm(&env);
 
     // Propose upgrade
     let proposal_id = client.propose_upgrade(&signer1, &wasm_hash, &0u64);
@@ -173,7 +173,7 @@ fn test_execute_upgrade_insufficient_approvals() {
     // Initialize with multisig (3 of 3)
     client.init(&signers, &3);
 
-    let wasm_hash = upload_wasm(&env);
+    let wasm_hash = fake_wasm(&env);
 
     // Propose upgrade
     let proposal_id = client.propose_upgrade(&signer1, &wasm_hash, &0u64);
@@ -226,7 +226,7 @@ fn test_execute_upgrade_when_state_inconsistent() {
 
     client.init(&signers, &1);
 
-    let wasm_hash = upload_wasm(&env);
+    let wasm_hash = fake_wasm(&env);
     let proposal_id = client.propose_upgrade(&signer1, &wasm_hash, &0u64);
     client.approve_upgrade(&proposal_id, &signer1);
 
@@ -257,7 +257,7 @@ fn test_execute_upgrade_when_paused() {
 
     client.init(&signers, &1);
 
-    let wasm_hash = upload_wasm(&env);
+    let wasm_hash = fake_wasm(&env);
     let proposal_id = client.propose_upgrade(&signer1, &wasm_hash, &0u64);
     client.approve_upgrade(&proposal_id, &signer1);
 
@@ -298,7 +298,7 @@ fn test_execute_upgrade_already_executed() {
 
     client.init(&signers, &1);
 
-    let wasm_hash = upload_wasm(&env);
+    let wasm_hash = fake_wasm(&env);
     let proposal_id = client.propose_upgrade(&signer1, &wasm_hash, &0u64);
     client.approve_upgrade(&proposal_id, &signer1);
 
@@ -340,7 +340,7 @@ fn test_execute_upgrade_version_tracking() {
     );
 
     // Create upgrade proposal
-    let wasm_hash = upload_wasm(&env);
+    let wasm_hash = fake_wasm(&env);
     let proposal_id = client.propose_upgrade(&signer1, &wasm_hash, &0u64);
     client.approve_upgrade(&proposal_id, &signer1);
 
@@ -365,7 +365,7 @@ fn test_execute_upgrade_events_emitted() {
 
     client.init(&signers, &1);
 
-    let wasm_hash = upload_wasm(&env);
+    let wasm_hash = fake_wasm(&env);
     let proposal_id = client.propose_upgrade(&signer1, &wasm_hash, &0u64);
     client.approve_upgrade(&proposal_id, &signer1);
 
@@ -398,7 +398,7 @@ fn test_execute_upgrade_security_validations() {
     assert!(invariants.healthy, "Contract should start in healthy state");
 
     // Test 2: Create valid proposal
-    let wasm_hash = upload_wasm(&env);
+    let wasm_hash = fake_wasm(&env);
     let proposal_id = client.propose_upgrade(&signer1, &wasm_hash, &0u64);
     client.approve_upgrade(&proposal_id, &signer1);
 
