@@ -5,7 +5,9 @@
 //! - Optimized storage access patterns
 //! - Reduced redundant computations
 
-use soroban_sdk::{Address, Env, String, Symbol, Vec};
+use soroban_sdk::{vec, Address, Env, String, Symbol, Vec};
+#[cfg(test)]
+use soroban_sdk::testutils::storage::Instance;
 
 /// Optimized batch lock processing with cached program data.
 pub fn optimized_batch_lock<F>(
@@ -102,10 +104,7 @@ pub mod storage_efficiency {
     
     /// Extend TTL for frequently accessed data.
     pub fn extend_storage_ttl(env: &Env, key: &Symbol, ttl_threshold: u32) {
-        let current_ttl = env.storage().instance().get_ttl(key);
-        if current_ttl < ttl_threshold {
-            env.storage().instance().extend_ttl(key, ttl_threshold, ttl_threshold);
-        }
+        env.storage().instance().extend_ttl(ttl_threshold, ttl_threshold);
     }
     
     /// Check if storage key exists without retrieving value.
