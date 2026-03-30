@@ -15,6 +15,7 @@ use soroban_sdk::{
 #[cfg(test)]
 use soroban_sdk::testutils::Address as _;
 pub mod asset;
+pub mod commit_reveal;
 pub mod errors;
 mod governance;
 pub mod nonce;
@@ -978,9 +979,7 @@ impl GrainlifyContract {
         env.storage().instance().set(&DataKey::Version, &VERSION);
 
         // Read-only mode defaults to false
-        env.storage()
-            .instance()
-            .set(&DataKey::ReadOnlyMode, &false);
+        env.storage().instance().set(&DataKey::ReadOnlyMode, &false);
 
         // Track successful operation
         monitoring::track_operation(&env, symbol_short!("init"), admin, true);
@@ -1143,12 +1142,7 @@ impl GrainlifyContract {
     ///
     /// # Returns
     /// * `u64` - The proposal ID
-    pub fn propose_upgrade(
-        env: Env,
-        proposer: Address,
-        wasm_hash: BytesN<32>,
-        expiry: u64,
-    ) -> u64 {
+    pub fn propose_upgrade(env: Env, proposer: Address, wasm_hash: BytesN<32>, expiry: u64) -> u64 {
         let proposal_id = MultiSig::propose(&env, proposer.clone(), expiry);
 
         if env
@@ -1788,13 +1782,24 @@ impl GrainlifyContract {
     /// Verifies that the instance storage aligns with the documented layout.
     pub fn verify_storage_layout(env: Env) -> bool {
         let admin_ok = env.storage().instance().has(&DataKey::Admin)
-            && env.storage().instance().get::<_, Address>(&DataKey::Admin).is_some();
+            && env
+                .storage()
+                .instance()
+                .get::<_, Address>(&DataKey::Admin)
+                .is_some();
 
         let version_ok = env.storage().instance().has(&DataKey::Version)
-            && env.storage().instance().get::<_, u32>(&DataKey::Version).is_some();
+            && env
+                .storage()
+                .instance()
+                .get::<_, u32>(&DataKey::Version)
+                .is_some();
 
         let migration_ok = if env.storage().instance().has(&DataKey::MigrationState) {
-            env.storage().instance().get::<_, crate::MigrationState>(&DataKey::MigrationState).is_some()
+            env.storage()
+                .instance()
+                .get::<_, crate::MigrationState>(&DataKey::MigrationState)
+                .is_some()
         } else {
             true
         };
@@ -1828,10 +1833,7 @@ impl GrainlifyContract {
             timestamp: env.ledger().timestamp(),
         };
 
-        env.events().publish(
-            (symbol_short!("ROModeChg"),),
-            event,
-        );
+        env.events().publish((symbol_short!("ROModeChg"),), event);
     }
 
     fn require_not_read_only(env: &Env) {
@@ -1935,6 +1937,121 @@ impl GrainlifyContract {
             }
         }
         snapshots
+    }
+
+    /// Retrieves a specific configuration snapshot by ID.
+    pub fn get_config_snapshot(env: Env, snapshot_id: u64) -> Option<CoreConfigSnapshot> {
+        env.storage()
+            .instance()
+            .get(&DataKey::ConfigSnapshot(snapshot_id))
+    }
+
+    /// Retrieves the most recently created configuration snapshot.
+    pub fn get_latest_config_snapshot(env: Env) -> Option<CoreConfigSnapshot> {
+        let index: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::SnapshotIndex)
+            .unwrap_or(Vec::new(&env));
+        if index.is_empty() {
+            return None;
+        }
+        let latest_id = index.get(index.len() - 1).unwrap();
+        env.storage()
+            .instance()
+            .get(&DataKey::ConfigSnapshot(latest_id))
+    }
+
+    /// Returns the number of currently retained configuration snapshots.
+    pub fn get_snapshot_count(env: Env) -> u32 {
+        let index: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::SnapshotIndex)
+            .unwrap_or(Vec::new(&env));
+        index.len()
+    }
+
+    /// Compares two snapshots and returns a diff indicating what changed.
+    pub fn compare_snapshots(env: Env, from_id: u64, to_id: u64) -> SnapshotDiff {
+        let from: CoreConfigSnapshot = env
+            .storage()
+            .instance()
+            .get(&DataKey::ConfigSnapshot(from_id))
+            .unwrap_or_else(|| panic!("Snapshot not found: from_id"));
+        let to: CoreConfigSnapshot = env
+            .storage()
+            .instance()
+            .get(&DataKey::ConfigSnapshot(to_id))
+            .unwrap_or_else(|| panic!("Snapshot not found: to_id"));
+        SnapshotDiff {
+            from_id,
+            to_id,
+            admin_changed: from.admin != to.admin,
+            version_changed: from.version != to.version,
+            previous_version_changed: from.previous_version != to.previous_version,
+            multisig_threshold_changed: from.multisig_threshold != to.multisig_threshold,
+            multisig_signers_changed: from.multisig_signers != to.multisig_signers,
+            from_version: from.version,
+            to_version: to.version,
+        }
+    }
+
+    /// Returns aggregated rollback intelligence for operators.
+    pub fn get_rollback_info(env: Env) -> RollbackInfo {
+        let current_version: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Version)
+            .unwrap_or(0);
+        let previous_version: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PreviousVersion)
+            .unwrap_or(0);
+        let rollback_available = previous_version > 0;
+
+        let migration_state: Option<MigrationState> = env
+            .storage()
+            .instance()
+            .get(&DataKey::MigrationState);
+        let has_migration = migration_state.is_some();
+        let migration_from_version = migration_state.as_ref().map(|m| m.from_version).unwrap_or(0);
+        let migration_to_version = migration_state.as_ref().map(|m| m.to_version).unwrap_or(0);
+        let migration_timestamp = migration_state.as_ref().map(|m| m.migrated_at).unwrap_or(0);
+
+        let index: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::SnapshotIndex)
+            .unwrap_or(Vec::new(&env));
+        let snapshot_count = index.len();
+        let has_snapshot = snapshot_count > 0;
+        let (latest_snapshot_id, latest_snapshot_version) = if has_snapshot {
+            let latest_id = index.get(snapshot_count - 1).unwrap();
+            let snap: CoreConfigSnapshot = env
+                .storage()
+                .instance()
+                .get(&DataKey::ConfigSnapshot(latest_id))
+                .unwrap_or_else(|| panic!("Snapshot index inconsistency"));
+            (latest_id, snap.version)
+        } else {
+            (0u64, 0u32)
+        };
+
+        RollbackInfo {
+            current_version,
+            previous_version,
+            rollback_available,
+            has_migration,
+            migration_from_version,
+            migration_to_version,
+            migration_timestamp,
+            snapshot_count,
+            has_snapshot,
+            latest_snapshot_id,
+            latest_snapshot_version,
+        }
     }
 
     /// Retrieves the chain identifier.

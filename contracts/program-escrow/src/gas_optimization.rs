@@ -102,10 +102,7 @@ pub mod storage_efficiency {
     
     /// Extend TTL for frequently accessed data.
     pub fn extend_storage_ttl(env: &Env, _key: &Symbol, ttl_threshold: u32) {
-        let current_ttl = env.storage().instance().get_ttl();
-        if current_ttl < ttl_threshold {
-            env.storage().instance().extend_ttl(ttl_threshold, ttl_threshold);
-        }
+        env.storage().instance().extend_ttl(ttl_threshold, ttl_threshold);
     }
     
     /// Check if storage key exists without retrieving value.

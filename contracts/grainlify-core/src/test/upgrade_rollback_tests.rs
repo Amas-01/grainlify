@@ -891,7 +891,10 @@ fn test_propose_upgrade_stores_expiry_in_record() {
         .get_upgrade_proposal(&proposal_id)
         .expect("proposal record must exist");
 
-    assert_eq!(record.expiry, expiry, "expiry must round-trip through storage");
+    assert_eq!(
+        record.expiry, expiry,
+        "expiry must round-trip through storage"
+    );
     assert!(!record.cancelled, "new proposal must not be cancelled");
 }
 
