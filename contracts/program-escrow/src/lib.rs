@@ -604,6 +604,14 @@ pub struct ProgramMetadataUpdatedEvent {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProgramPublishedEvent {
+    pub version: u32,
+    pub program_id: String,
+    pub published_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProgramMetadataField {
     pub key: String,
     pub value: String,
@@ -1126,6 +1134,10 @@ mod test_storage_layout;
 
 #[cfg(test)]
 mod test_error_discrimination;
+#[cfg(test)]
+mod test_draft_state;
+#[cfg(test)]
+mod test_fee_on_transfer;
 // mod test_payout_splits;
 mod test_batch_limits;
 
@@ -1461,6 +1473,30 @@ impl ProgramEscrowContract {
         program_data
     }
 
+    pub fn publish_program(env: Env, program_id: String) -> ProgramData {
+        let mut program_data = Self::get_program_data_by_id(&env, &program_id);
+        program_data.authorized_payout_key.require_auth();
+
+        if program_data.status != ProgramStatus::Draft {
+            panic!("Program already published");
+        }
+
+        program_data.status = ProgramStatus::Active;
+        Self::store_program_data(&env, &program_id, &program_data);
+
+        // Emit ProgramPublished event
+        env.events().publish(
+            (symbol_short!("PrgPub"),),
+            ProgramPublishedEvent {
+                version: EVENT_VERSION_V2,
+                program_id,
+                published_at: env.ledger().timestamp(),
+            },
+        );
+
+        program_data
+    }
+
     pub fn init_program_with_metadata(
         env: Env,
         program_id: String,
@@ -1613,6 +1649,48 @@ impl ProgramEscrowContract {
                             result.push_back(id.clone());
                             count += 1;
                         }
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    /// Query programs by tag
+    pub fn query_programs_by_tag(
+        env: Env,
+        tag: String,
+        start: u32,
+        limit: u32,
+    ) -> soroban_sdk::Vec<String> {
+        let registry: soroban_sdk::Vec<String> = env
+            .storage()
+            .instance()
+            .get(&PROGRAM_REGISTRY)
+            .unwrap_or(soroban_sdk::Vec::new(&env));
+        let mut result = soroban_sdk::Vec::new(&env);
+        let mut count = 0;
+        let mut skipped = 0;
+
+        for id in registry.iter() {
+            if let Some(program) = env
+                .storage()
+                .instance()
+                .get::<_, ProgramData>(&DataKey::Program(id.clone()))
+            {
+                let mut has_tag = false;
+                for t in program.metadata.tags.iter() {
+                    if t == tag {
+                        has_tag = true;
+                        break;
+                    }
+                }
+                if has_tag {
+                    if skipped < start {
+                        skipped += 1;
+                    } else if count < limit {
+                        result.push_back(id.clone());
+                        count += 1;
                     }
                 }
             }
@@ -1893,6 +1971,7 @@ impl ProgramEscrowContract {
     }
 
     fn lock_program_funds_internal(env: Env, amount: i128, from: Option<Address>) -> ProgramData {
+        Self::require_not_read_only(&env);
         // Validation precedence (deterministic ordering):
         // 1. Contract initialized
         // 2. Program must be in Active status (not Draft)
@@ -1924,28 +2003,42 @@ impl ProgramEscrowContract {
         }
 
         let mut program_data: ProgramData = env.storage().instance().get(&PROGRAM_DATA).unwrap();
+        let contract_address = env.current_contract_address();
+        let token_client = token::Client::new(&env, &program_data.token_address);
+
+        // Handle inbound transfer and measure actual received amount (handles fee-on-transfer tokens)
+        let actual_received = if let Some(depositor) = from {
+            depositor.require_auth();
+            let balance_before = token_client.balance(&contract_address);
+
+            token_client.transfer_from(&contract_address, &depositor, &contract_address, &amount);
+
+            let balance_after = token_client.balance(&contract_address);
+            let diff = crate::token_math::safe_sub(balance_after, balance_before);
+
+            if diff <= 0 {
+                panic!("Inbound transfer failed or zero value");
+            }
+            diff
+        } else {
+            // If No depositor is provided, we assume the tokens are already present
+            // and 'amount' is what should be credited.
+            amount
+        };
 
         // Get fee configuration
         let fee_config = Self::get_fee_config_internal(&env);
 
-        // Calculate fees if enabled
+        // Calculate fees based on actually received tokens
         let fee_amount = Self::combined_fee_amount(
-            amount,
+            actual_received,
             fee_config.lock_fee_rate,
             fee_config.lock_fixed_fee,
             fee_config.fee_enabled,
         );
-        let net_amount = crate::token_math::safe_sub(amount, fee_amount);
+        let net_amount = crate::token_math::safe_sub(actual_received, fee_amount);
         if net_amount <= 0 {
-            panic!("Lock fee consumes entire lock amount");
-        }
-
-        let contract_address = env.current_contract_address();
-        let token_client = token::Client::new(&env, &program_data.token_address);
-
-        if let Some(depositor) = from {
-            depositor.require_auth();
-            token_client.transfer_from(&contract_address, &depositor, &contract_address, &amount);
+            panic!("Lock fee consumes entire received amount");
         }
 
         if fee_amount > 0 {
@@ -2823,6 +2916,12 @@ impl ProgramEscrowContract {
                     panic!("Program not initialized")
                 });
 
+        // Check if program is in Active status
+        if program_data.status == ProgramStatus::Draft {
+            reentrancy_guard::clear_entered(&env);
+            panic!("Program is in Draft status. Publish the program first.");
+        }
+
         // 3. Read-only mode
         if env
             .storage()
@@ -3021,6 +3120,12 @@ impl ProgramEscrowContract {
                     panic!("Program not initialized")
                 });
 
+        // Check if program is in Active status
+        if program_data.status == ProgramStatus::Draft {
+            reentrancy_guard::clear_entered(&env);
+            panic!("Program is in Draft status. Publish the program first.");
+        }
+
         // 3. Read-only mode
         if env
             .storage()
@@ -3214,6 +3319,10 @@ impl ProgramEscrowContract {
             .get(&PROGRAM_DATA)
             .unwrap_or_else(|| panic!("Program not initialized"));
 
+        if program_data.status == ProgramStatus::Draft {
+            panic!("Program is in Draft status. Publish the program first.");
+        }
+
         Self::authorize_release_actor(&env, &program_data, caller.as_ref());
 
         if amount <= 0 {
@@ -3285,6 +3394,11 @@ impl ProgramEscrowContract {
                 reentrancy_guard::clear_entered(&env);
                 panic!("Program not initialized")
             });
+
+        if program_data.status == ProgramStatus::Draft {
+            reentrancy_guard::clear_entered(&env);
+            panic!("Program is in Draft status. Publish the program first.");
+        }
         Self::authorize_release_actor(&env, &program_data, caller.as_ref());
 
         if Self::check_paused(&env, symbol_short!("release")) {
@@ -3404,6 +3518,13 @@ impl ProgramEscrowContract {
     }
 
     pub fn lock_program_funds_v2(env: Env, program_id: String, amount: i128) -> ProgramData {
+        Self::require_not_read_only(&env);
+        // Validation precedence (deterministic ordering):
+        // 1. Amount > 0
+        // 2. Program exists
+        // 3. Program must be in Active status (not Draft)
+        // 4. Contract balance check (detects FoT issues if tokens were sent beforehand)
+
         if amount <= 0 {
             panic!("Amount must be greater than zero");
         }
@@ -3415,6 +3536,19 @@ impl ProgramEscrowContract {
             .get(&program_key)
             .unwrap_or_else(|| panic!("Program not found"));
 
+        if program_data.status == ProgramStatus::Draft {
+            panic!("Program is in Draft status. Publish the program first.");
+        }
+
+        let token_client = token::Client::new(&env, &program_data.token_address);
+        let contract_address = env.current_contract_address();
+
+        // Ensure contract actually holds enough tokens to cover this lock.
+        // If tokens were sent via direct transfer and a fee was taken, this check will catch it.
+        if token_client.balance(&contract_address) < amount {
+            panic!("Insufficient contract balance to cover lock (possible fee-on-transfer issue)");
+        }
+
         let fee_config = Self::get_fee_config_internal(&env);
         let (fee_amount, net_amount) = if fee_config.fee_enabled && fee_config.lock_fee_rate > 0 {
             token_math::split_amount(amount, fee_config.lock_fee_rate)
@@ -3423,12 +3557,7 @@ impl ProgramEscrowContract {
         };
 
         if fee_amount > 0 {
-            let token_client = token::Client::new(&env, &program_data.token_address);
-            token_client.transfer(
-                &env.current_contract_address(),
-                &fee_config.fee_recipient,
-                &fee_amount,
-            );
+            token_client.transfer(&contract_address, &fee_config.fee_recipient, &fee_amount);
         }
 
         program_data.total_funds = crate::token_math::safe_add(program_data.total_funds, amount);
@@ -3528,6 +3657,7 @@ impl ProgramEscrowContract {
         recipient: Address,
         amount: i128,
     ) -> ProgramData {
+        Self::require_not_read_only(&env);
         // For now, single_payout still uses global data in several places internally
         // so we just call the existing one but we should ideally update it too.
         // Actually, let's just implement it here to be safe.
@@ -3537,6 +3667,10 @@ impl ProgramEscrowContract {
             .instance()
             .get(&program_key)
             .unwrap_or_else(|| panic!("Program not found"));
+
+        if program_data.status == ProgramStatus::Draft {
+            panic!("Program is in Draft status. Publish the program first.");
+        }
 
         if amount <= 0 || amount > program_data.remaining_balance {
             panic!("Invalid payout amount");
@@ -3623,6 +3757,11 @@ impl ProgramEscrowContract {
             .instance()
             .get(&PROGRAM_DATA)
             .unwrap_or_else(|| panic!("Program not initialized"));
+
+        if program.status == ProgramStatus::Draft {
+            panic!("Program is in Draft status. Publish the program first.");
+        }
+
         program.authorized_payout_key.require_auth();
         payout_splits::execute_split_payout(&env, &program_id, total_amount)
     }
@@ -4021,6 +4160,10 @@ impl ProgramEscrowContract {
     ) {
         let mut schedules = Self::get_release_schedules(env.clone());
         let program_data = Self::get_program_info(env.clone());
+
+        if program_data.status == ProgramStatus::Draft {
+            panic!("Program is in Draft status. Publish the program first.");
+        }
 
         let caller = Self::authorize_release_actor(&env, &program_data, caller.as_ref());
         let now = env.ledger().timestamp();
