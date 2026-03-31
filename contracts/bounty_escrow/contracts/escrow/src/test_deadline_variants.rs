@@ -27,6 +27,7 @@ fn create_escrow_contract<'a>(e: &Env) -> BountyEscrowContractClient<'a> {
     let id = e.register_contract(None, BountyEscrowContract);
     BountyEscrowContractClient::new(e, &id)
 }
+const NO_DEADLINE: u64 = u64::MAX;
 
 struct Setup<'a> {
     env: Env,

@@ -200,7 +200,6 @@ fn serialization_compatibility_public_types_and_events() {
                 amount: 1234,
                 expires_at: 555,
                 claimed: false,
-                reason: DisputeReason::Other,
             }
             .into_val(&env),
         ),
@@ -296,6 +295,7 @@ fn serialization_compatibility_public_types_and_events() {
                 amount: 100,
                 refund_to: depositor.clone(),
                 timestamp: 200,
+                trigger_type: crate::events::RefundTriggerType::DeadlineExpired,
             }
             .into_val(&env),
         ),
