@@ -1335,7 +1335,7 @@ impl GrainlifyContract {
         
         // Emit configuration change event
         env.events().publish(
-            (symbol_short!("timelock"), symbol_short!("delay_changed")),
+            (symbol_short!("timelock"), symbol_short!("dly_chg")),
             (old_delay, delay_seconds)
         );
     }
@@ -2810,6 +2810,7 @@ mod test {
     // Include end-to-end upgrade and migration tests
     pub mod e2e_upgrade_migration_tests;
     pub mod invariant_entrypoints_tests;
+    pub mod nonce_tests;
     pub mod state_snapshot_tests;
     pub mod upgrade_rollback_scenarios;
     pub mod upgrade_rollback_tests;
