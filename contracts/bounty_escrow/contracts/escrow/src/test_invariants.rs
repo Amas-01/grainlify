@@ -191,6 +191,8 @@ fn test_invariant_checker_catches_negative_amount() {
         status: EscrowStatus::Locked,
         deadline: env.ledger().timestamp() + 1000,
         refund_history: vec![&env],
+        creation_timestamp: 0,
+        expiry: 0,
         archived: false,
         archived_at: None,
     };
@@ -215,6 +217,8 @@ fn test_invariant_checker_catches_negative_remaining_amount() {
         status: EscrowStatus::Locked,
         deadline: env.ledger().timestamp() + 1000,
         refund_history: vec![&env],
+        creation_timestamp: 0,
+        expiry: 0,
         archived: false,
         archived_at: None,
     };
@@ -239,6 +243,8 @@ fn test_invariant_checker_catches_remaining_amount_exceeds_amount() {
         status: EscrowStatus::Locked,
         deadline: env.ledger().timestamp() + 1000,
         refund_history: vec![&env],
+        creation_timestamp: 0,
+        expiry: 0,
         archived: false,
         archived_at: None,
     };
@@ -263,6 +269,8 @@ fn test_invariant_checker_catches_released_with_nonzero_remaining() {
         status: EscrowStatus::Released,
         deadline: env.ledger().timestamp() + 1000,
         refund_history: vec![&env],
+        creation_timestamp: 0,
+        expiry: 0,
         archived: false,
         archived_at: None,
     };
@@ -286,6 +294,8 @@ fn test_invariant_checker_allows_valid_edge_cases() {
         status: EscrowStatus::Released,
         deadline: env.ledger().timestamp() + 1000,
         refund_history: vec![&env],
+        creation_timestamp: 0,
+        expiry: 0,
         archived: false,
         archived_at: None,
     };
@@ -302,6 +312,8 @@ fn test_invariant_checker_allows_valid_edge_cases() {
         status: EscrowStatus::Locked,
         deadline: env.ledger().timestamp() + 1000,
         refund_history: vec![&env],
+        creation_timestamp: 0,
+        expiry: 0,
         archived: false,
         archived_at: None,
     };
@@ -318,6 +330,8 @@ fn test_invariant_checker_allows_valid_edge_cases() {
         status: EscrowStatus::Released,
         deadline: env.ledger().timestamp() + 1000,
         refund_history: vec![&env],
+        creation_timestamp: 0,
+        expiry: 0,
         archived: false,
         archived_at: None,
     };
@@ -348,6 +362,8 @@ fn test_invariant_checker_partial_refund_state() {
         status: EscrowStatus::Locked,
         deadline,
         refund_history: vec![&env],
+        creation_timestamp: 0,
+        expiry: 0,
         archived: false,
         archived_at: None,
     };

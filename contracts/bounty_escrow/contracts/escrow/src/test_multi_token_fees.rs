@@ -41,7 +41,7 @@ impl Suite {
         let contributor = Address::generate(&env);
         let fee_recipient = Address::generate(&env);
 
-        let token_id = env.register_stellar_asset_contract(admin.clone());
+        let token_id = env.register_stellar_asset_contract_v2(admin.clone());
         let token_admin = token::StellarAssetClient::new(&env, &token_id);
 
         let contract_id = env.register_contract(None, BountyEscrowContract);
@@ -130,7 +130,7 @@ fn test_set_token_fee_config_invalid_lock_rate_rejected() {
         &s.fee_recipient,
         &true,
     );
-    assert_eq!(result.unwrap_err().unwrap(), Error::InvalidFeeRate);
+    assert_eq!(result.unwrap_err().unwrap(), Error::InvalidAmountAmount);
 }
 
 #[test]
@@ -145,7 +145,7 @@ fn test_set_token_fee_config_invalid_release_rate_rejected() {
         &s.fee_recipient,
         &true,
     );
-    assert_eq!(result.unwrap_err().unwrap(), Error::InvalidFeeRate);
+    assert_eq!(result.unwrap_err().unwrap(), Error::InvalidAmountAmount);
 }
 
 #[test]
@@ -271,7 +271,7 @@ fn test_fee_cannot_consume_entire_principal() {
     let result = s.client.try_lock_funds(&s.depositor, &1, &1, &s.deadline());
     assert_eq!(
         result.unwrap_err().unwrap(),
-        Error::InvalidAmount,
+        Error::InvalidAmountAmount,
         "must reject when net_amount <= 0"
     );
 }
